@@ -55,6 +55,7 @@ window.addEventListener('keydown', e=>{
   if(state!==S.SELECT) return; const m={'1':0,'2':1,'3':2};
   if(e.key in m){ selHighlight=m[e.key]; } else if(e.key==='Enter'||e.key===' '){ selectPart(PART_ORDER[selHighlight]); e.preventDefault(); } });
 fxc.addEventListener('pointerdown', e=>{
+  if(camDenied && !camOK){ askCamera().catch(err=>log('cam retry FAIL',err?.message)); e.preventDefault(); return; }   // tap re-asks for the camera
   if(state===S.REPORT && st>2.0){ enter(S.RETURN); e.preventDefault(); return; }   // the certificate can be dismissed — tap to continue
   if(state!==S.SELECT || forcePart) return; const r=fxc.getBoundingClientRect(); if(!r.width) return;
   const sz=sizePx, x=(e.clientX-r.left)/r.width*sz, y=(e.clientY-r.top)/r.height*sz, oW=sz*0.20, ox=sz/2-(PART_ORDER.length*oW)/2, oy=sz*0.058;
@@ -333,7 +334,7 @@ function drawIdealGeo(R,alpha,hideLabel){ const ref=idealNormFor(curPart); if(!r
 function drawPartIdeal(R,alpha,withRing){ if(curPart.flesh && idealReady) drawIdeal(R,alpha,withRing); else drawIdealGeo(R,alpha); }
 
 /* ---------- MediaPipe ---------- */
-let liveLM=null, camOK=false, lastVT=-1, delegateUsed='-', faceCount=0, lastLM=null;
+let liveLM=null, camOK=false, camDenied=false, lastVT=-1, delegateUsed='-', faceCount=0, lastLM=null;
 const LIPS=[61,185,40,39,37,0,267,269,270,409,291,375,321,405,314,17,84,181,91,146];
 /* ---------- selectable body parts · LIPS = photographic ideal, NOSE/EYES = geometric ideal ---------- */
 const EYE_R=[33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246];        // subject's right eye ring (16)
@@ -398,11 +399,12 @@ async function goLive(){
   if(location.search.includes('nocam')){ camOK=false; return; }
   try{ liveLM=await makeLandmarker("GPU"); delegateUsed='GPU'; }catch(e){ try{ liveLM=await makeLandmarker("CPU"); delegateUsed='CPU'; }catch(e2){ liveLM=null; delegateUsed='FAIL'; log('LM FAIL',e2?.message); } }
   if(location.search.includes('demoface')){ try{ await useDemoFace(); }catch(e){ camOK=false; log('demo FAIL',e?.message); } return; }
-  try{                                                          // camera is the default
-    const st=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:1920},height:{ideal:1920}},audio:false});   // higher res → more mouth pixels, less upscale blur
-    vid.srcObject=st; await vid.play(); camOK=true;
-  }catch(e){ log('cam unavailable → demo fallback', e?.message);   // denied/busy/none → never sit blank
-    try{ await useDemoFace(); }catch(e2){ camOK=false; log('demo FAIL',e2?.message); } }
+  try{ await askCamera(); }                                     // camera is the default
+  catch(e){ camDenied=true; camOK=false; log('cam unavailable → awaiting permission', e?.message); }   // denied/busy/none → standby asks for the camera (tap retries); no silent demo face
+}
+async function askCamera(){
+  const st=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:1920},height:{ideal:1920}},audio:false});   // higher res → more mouth pixels, less upscale blur
+  vid.srcObject=st; await vid.play(); camOK=true; camDenied=false;
 }
 function readMouth(nowMs){
   if(!liveLM||!camOK||vid.readyState<2) return; if(vid.currentTime===lastVT) return; lastVT=vid.currentTime;
@@ -1260,7 +1262,8 @@ function vPick(){ const cs=arguments; return ()=>{ for(let i=0;i<cs.length;i++){
 /* 2 · verbose analyst commentary — templates resolved once at line start, stable through the typewriter */
 // every bottom voice line ≤7 words, clear. (rendered uppercase; dynamic parts stay part-aware)
 const COMMENTARY={
-  [S.STANDBY]:[()=>'PRESENT YOUR FACE FOR MEASUREMENT.', ()=>'THE POPULATION IS WAITING.'],
+  [S.STANDBY]:[()=> camDenied?'THIS INSTRUMENT REQUIRES YOUR CAMERA.':'PRESENT YOUR FACE FOR MEASUREMENT.',
+               ()=> camDenied?'ALLOW CAMERA ACCESS. TAP TO RETRY.':'THE POPULATION IS WAITING.'],
   [S.FACE]:[()=>'LOCATING YOUR FACE.', ()=>'FACE FOUND. HOLD STILL.'],
   [S.SELECT]:[()=>'CHOOSE A REGION TO MEASURE.', ()=>'THREE MODULES LOADED. ELEVEN PENDING.'],
   [S.DISFACE]:[()=>'SEPARATING YOUR FACE INTO PARTS.', ()=>'TODAY WE TAKE YOUR '+partSg()+'.'],
