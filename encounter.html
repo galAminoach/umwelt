@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title> </title>
+<style>
+  @font-face{ font-family:'PP Fraktion Mono'; src:url('fonts/PPFraktionMono-Regular.otf') format('opentype'); font-weight:400; font-display:swap; }
+  @font-face{ font-family:'PP Fraktion Mono'; src:url('fonts/PPFraktionMono-Bold.otf') format('opentype'); font-weight:700; font-display:swap; }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;background:#000;overflow:hidden}
+  body{ display:flex;align-items:center;justify-content:center; background:#000; }
+  /* 1:1 square. cold QC overlay on warm wet real flesh — the collision is the piece. */
+  .stage{ position:relative; width:min(96vmin,960px); height:min(96vmin,960px); overflow:hidden; background:#000;
+    box-shadow:0 0 0 1px rgba(0,255,204,0.06), inset 0 0 180px 16px rgba(0,0,0,0.92); }
+  canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+  #gl{z-index:2} #fx{z-index:3}
+  .glass{ position:absolute;inset:0;z-index:4;pointer-events:none;
+    background:radial-gradient(145% 145% at 50% 50%, rgba(0,0,0,0) 60%, rgba(0,0,0,0.55) 100%); mix-blend-mode:multiply; }
+  #encdbg{position:absolute;top:6px;left:8px;z-index:6;font:11px 'PP Fraktion Mono',monospace;color:#00ffcc;text-shadow:0 0 4px #000;white-space:pre;pointer-events:none}
+  video{position:absolute;width:2px;height:2px;opacity:0;pointer-events:none;left:-10px;top:-10px}
+</style>
+</head>
+<body>
+  <div class="stage" id="stage">
+    <canvas id="gl"></canvas>
+    <canvas id="fx"></canvas>
+    <div class="glass"></div>
+    <div id="encdbg"></div>
+    <video id="vid" playsinline muted></video>
+  </div>
+
+<script type="module">
+import { FaceLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const cv=document.getElementById('gl');
+const gl=cv.getContext('webgl2',{alpha:false});
+const fxc=document.getElementById('fx'); const xc=fxc.getContext('2d');
+const vid=document.getElementById('vid');
+if(!gl) throw new Error('no webgl2');
+const clamp=(x,a,b)=>Math.max(a,Math.min(b,x)), lerp=(a,b,t)=>a+(b-a)*t;
+const smoothstep=(a,b,x)=>{const t=clamp((x-a)/(b-a),0,1);return t*t*(3-2*t);};
+const rnd=(s)=>{ const x=Math.sin(s*127.1)*43758.5453; return x-Math.floor(x); };
+const DEBUG=location.search.includes('debug');
+const CYAN='#00ffcc', CY='rgba(0,255,204,', WHITE='#ffffff';
+const HEB="'Heebo','Arial Hebrew','Helvetica Neue',sans-serif";   // only the two large Hebrew words use this
+
+/* ===== the live mouth — warm wet real flesh. uNorm normalises it toward the IDEAL (texture/asymmetry lost). ===== */
+const VERT=`#version 300 es
+in vec2 c; out vec2 uv; void main(){ uv=c*0.5+0.5; gl_Position=vec4(c,0.,1.); }`;
+const FRAG=`#version 300 es
+precision highp float; in vec2 uv; out vec4 O;
+uniform sampler2D uMouth; uniform float uTime,uHasCrop,uAspect,uCapture,uNorm,uCenterX,uScale,uAlpha;
+float hash(vec2 p){ p=fract(p*vec2(123.34,456.21)); p+=dot(p,p+45.32); return fract(p.x*p.y); }
+float vnoise(vec2 p){ vec2 i=floor(p),f=fract(p); f=f*f*(3.-2.*f);
+  float a=hash(i),b=hash(i+vec2(1,0)),c=hash(i+vec2(0,1)),d=hash(i+vec2(1,1));
+  return mix(mix(a,b,f.x),mix(c,d,f.x),f.y); }
+float fbm(vec2 p){ float s=0.,a=.5; for(int i=0;i<4;i++){ s+=a*vnoise(p); p*=2.04; a*=.5;} return s; }
+vec3 wet3(vec3 col){ col=pow(max(col,0.),vec3(1.06)); vec3 wine=vec3(0.5,0.07,0.17); return mix(col, col*wine*2.6, 0.15); }
+void main(){
+  vec2 p=uv; float n=clamp(uNorm,0.0,1.0);
+  vec2 box=vec2(0.40*uScale, 0.40/max(uAspect,1.0)*uScale);
+  vec2 d=(p-vec2(uCenterX,0.5))/box;
+  float t=uTime; float cap=clamp(uCapture,0.0,1.0);
+  vec2 flow=vec2(fbm(d*3.2+t*0.22), fbm(d*3.2 - t*0.18+7.0))-0.5;
+  vec2 dd=d + flow*0.018*(1.0-n);                                  // faint life, stilled as it normalises
+  vec2 cuv=clamp(dd*0.5+0.5,0.0,1.0);
+  vec3 ground=vec3(0.012,0.004,0.009);
+  vec3 flesh;
+  if(uHasCrop>0.5){
+    vec3 c0=texture(uMouth,cuv).rgb;
+    vec2 e=2.0/vec2(textureSize(uMouth,0)), e2=5.0/vec2(textureSize(uMouth,0));
+    vec3 bl=(texture(uMouth,cuv+vec2(e.x,0.)).rgb+texture(uMouth,cuv-vec2(e.x,0.)).rgb+texture(uMouth,cuv+vec2(0.,e.y)).rgb+texture(uMouth,cuv-vec2(0.,e.y)).rgb)*0.25;
+    vec3 bl2=(texture(uMouth,cuv+vec2(e2.x,0.)).rgb+texture(uMouth,cuv-vec2(e2.x,0.)).rgb+texture(uMouth,cuv+vec2(0.,e2.y)).rgb+texture(uMouth,cuv-vec2(0.,e2.y)).rgb)*0.25;
+    float shp=mix(2.4,0.0,n)+cap*1.0;                              // sharpen → 0 as it normalises
+    c0=c0+(c0-bl)*shp+(c0-bl2)*shp*0.4;
+    c0=mix(c0, bl2, n*0.78);                                       // flatten micro-detail (texture loss leads the mourning)
+    vec3 cM=texture(uMouth, vec2(1.0-cuv.x, cuv.y)).rgb;           // mirror across the lip centreline
+    c0=mix(c0, cM, n*0.55);                                        // asymmetry erased
+    flesh=clamp(c0,0.0,1.0);
+  } else flesh=vec3(0.30,0.06,0.12);
+  flesh=mix(flesh, wet3(flesh), 0.42);                            // warm wet grade — ALWAYS on (real flesh)
+  flesh=mix(flesh, vec3(dot(flesh,vec3(0.33))), n*0.14);          // desaturation only a faint secondary touch
+  float sheen=pow(max(0.0,1.0-length(d*vec2(0.8,1.2))),3.0);
+  flesh+=sheen*vec3(1.0,0.9,0.94)*0.16*(1.0-n*0.5);
+  vec2 dM=d; float r=length(dM*vec2(0.80,1.0));
+  r += (fbm(uv*3.4+t*0.16)-0.5)*0.10*(1.0-cap);
+  float lo=mix(0.46,0.84,cap), hi=1.01;
+  float mask=smoothstep(hi,lo,r)*clamp(uAlpha,0.0,1.0);
+  vec3 col=mix(ground, flesh, mask);
+  float vig=smoothstep(1.6,0.4,length((p-0.5)*2.0)); col*=0.62+0.38*vig;
+  col+=(hash(p*vec2(900.0)+t)-0.5)*0.008;
+  O=vec4(max(col,0.0),1.0);
+}`;
+function sh(ty,src){ const s=gl.createShader(ty); gl.shaderSource(s,src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+const prog=gl.createProgram(); gl.attachShader(prog,sh(gl.VERTEX_SHADER,VERT)); gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,FRAG));
+gl.linkProgram(prog); if(!gl.getProgramParameter(prog,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+const quad=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,quad);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+const cl=gl.getAttribLocation(prog,'c'); gl.enableVertexAttribArray(cl); gl.vertexAttribPointer(cl,2,gl.FLOAT,false,0,0);
+const U=(n)=>gl.getUniformLocation(prog,n);
+const u={ mouth:U('uMouth'),time:U('uTime'),hasCrop:U('uHasCrop'),aspect:U('uAspect'),capture:U('uCapture'),norm:U('uNorm'),centerX:U('uCenterX'),scale:U('uScale'),alpha:U('uAlpha') };
+gl.uniform1i(u.mouth,0);
+const mouthTex=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,mouthTex);
+for(const pn of [gl.TEXTURE_WRAP_S,gl.TEXTURE_WRAP_T]) gl.texParameteri(gl.TEXTURE_2D,pn,gl.CLAMP_TO_EDGE);
+for(const pn of [gl.TEXTURE_MIN_FILTER,gl.TEXTURE_MAG_FILTER]) gl.texParameteri(gl.TEXTURE_2D,pn,gl.LINEAR);
+
+let DPR=Math.min(window.devicePixelRatio||1,1.5), sizePx=960;
+function resize(){ const r=cv.getBoundingClientRect(); sizePx=r.width||960;
+  cv.width=fxc.width=Math.round(sizePx*DPR); cv.height=fxc.height=Math.round(sizePx*DPR);
+  gl.viewport(0,0,cv.width,cv.height); xc.setTransform(DPR,0,0,DPR,0,0); }
+window.addEventListener('resize',resize); resize();
+/* the live-mouth display rect for a given centre/scale (matches the shader box) */
+function mouthRect(cxN,scl){ cxN=cxN==null?0.5:cxN; scl=scl==null?1:scl; const bx=0.40*scl, by=0.40/Math.max(stillAspect,1.0)*scl;
+  return { x:(cxN-bx)*sizePx, y:(0.5-by)*sizePx, w:2*bx*sizePx, h:2*by*sizePx }; }
+
+/* ---------- crop the live video to the lips ---------- */
+const cropCv=document.createElement('canvas'); const cctx=cropCv.getContext('2d');
+let hasCrop=0, cropAspect=1.7, stillAspect=1.7;
+function updateCrop(){
+  if(frozen) return;
+  if(!camOK||vid.readyState<2||!vid.videoWidth) return;
+  const vw=vid.videoWidth,vh=vid.videoHeight; const sw=2*vidCrop.hx*vw, sh=2*vidCrop.hy*vh; if(sw<4||sh<4) return;
+  cropAspect=clamp(sw/sh,1.0,3.0); cropCv.width=1024; cropCv.height=Math.max(2,Math.round(1024/cropAspect));
+  cctx.save(); cctx.translate(cropCv.width,0); cctx.scale(-1,1);
+  try{ cctx.drawImage(vid,(vidCrop.cx-vidCrop.hx)*vw,(vidCrop.cy-vidCrop.hy)*vh,sw,sh,0,0,cropCv.width,cropCv.height); }catch(e){ cctx.restore(); return; }
+  cctx.restore();
+  gl.bindTexture(gl.TEXTURE_2D,mouthTex); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,cropCv); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false); hasCrop=1;
+}
+/* live lip ring (crop-normalised, top-down, mirrored to match display) */
+const LIPS=[61,185,40,39,37,0,267,269,270,409,291,375,321,405,314,17,84,181,91,146];
+function ringFromLM(L){ if(!L) return null; const cx=vidCrop.cx,cy=vidCrop.cy,hx=vidCrop.hx,hy=vidCrop.hy;
+  return LIPS.map(k=>{ const uX=1-(L[k].x-(cx-hx))/(2*hx); const v=(L[k].y-(cy-hy))/(2*hy); return [clamp(uX,0,1),clamp(v,0,1)]; }); }
+let liveRing=null, capRing=null, openAmt=0;
+function snapshotCapture(){ stillAspect=cropAspect; capRing=liveRing?liveRing.map(p=>p.slice()):null; }
+
+/* ---------- MediaPipe (lip landmarks only) ---------- */
+let liveLM=null, camOK=false, lastVT=-1, faceCount=0, lastLM=null;
+const vidCrop={cx:0.5,cy:0.62,hx:0.14,hy:0.10}; let presence=0, lastSeen=0;
+function log(...a){ console.log('[encounter]',...a); }
+async function makeLandmarker(d){ const fs=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  return FaceLandmarker.createFromOptions(fs,{baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",delegate:d},runningMode:"VIDEO",numFaces:1}); }
+let usingDemo=false;
+async function useDemoFace(){ const fimg=new Image(); fimg.src='faces/face1.jpg'; await fimg.decode();
+  const dc=document.createElement('canvas'); dc.width=dc.height=640; const dx=dc.getContext('2d'); const cs=Math.max(640/fimg.naturalWidth,640/fimg.naturalHeight);
+  (function dr(){ dx.fillStyle='#000'; dx.fillRect(0,0,640,640); dx.drawImage(fimg,(640-fimg.naturalWidth*cs)/2,(640-fimg.naturalHeight*cs)/2,fimg.naturalWidth*cs,fimg.naturalHeight*cs); requestAnimationFrame(dr); })();
+  vid.srcObject=dc.captureStream(30); await vid.play(); camOK=true; usingDemo=true; }
+async function goLive(){
+  if(location.search.includes('nocam')){ camOK=false; return; }
+  try{ liveLM=await makeLandmarker("GPU"); }catch(e){ try{ liveLM=await makeLandmarker("CPU"); }catch(e2){ liveLM=null; log('LM FAIL',e2?.message); } }
+  if(location.search.includes('demoface')){ try{ await useDemoFace(); }catch(e){ camOK=false; } return; }
+  try{ const st=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:1920},height:{ideal:1920}},audio:false}); vid.srcObject=st; await vid.play(); camOK=true; }
+  catch(e){ log('cam → demo fallback',e?.message); try{ await useDemoFace(); }catch(e2){ camOK=false; } }
+}
+function readMouth(nowMs){
+  if(!liveLM||!camOK||vid.readyState<2) return; if(vid.currentTime===lastVT) return; lastVT=vid.currentTime;
+  let res; try{ res=liveLM.detectForVideo(vid,nowMs); }catch(e){ return; }
+  faceCount=(res&&res.faceLandmarks)?res.faceLandmarks.length:0;
+  if(faceCount){ const L=res.faceLandmarks[0]; lastLM=L; let mnx=1,mxx=0,mny=1,mxy=0;
+    for(const k of LIPS){ const x=L[k].x,y=L[k].y; if(x<mnx)mnx=x; if(x>mxx)mxx=x; if(y<mny)mny=y; if(y>mxy)mxy=y; }
+    const cx=(mnx+mxx)/2, cy=(mny+mxy)/2, hx=(mxx-mnx)/2*1.16, hy=(mxy-mny)/2*1.42;
+    if(!frozen){ vidCrop.cx=lerp(vidCrop.cx,cx,0.4); vidCrop.cy=lerp(vidCrop.cy,cy,0.4); vidCrop.hx=lerp(vidCrop.hx,Math.max(0.04,hx),0.3); vidCrop.hy=lerp(vidCrop.hy,Math.max(0.03,hy),0.3); liveRing=ringFromLM(L); }
+    const op=clamp((Math.abs(L[13].y-L[14].y)/Math.max(1e-4,(mxx-mnx)))*3.4,0,1);  // mouth-open amount (inner lips)
+    openAmt=lerp(openAmt,op,0.4);
+    lastSeen=performance.now();
+  }
+}
+goLive();
+
+/* ===========================  THE OTHER — real lip cutouts (the only flesh of the collective) =========================== */
+const NLIP=35; const lipImgs=[]; let lipsLoaded=0;
+for(let i=0;i<NLIP;i++){ const im=new Image(); im.onload=()=>{ lipImgs[i]=im; if(++lipsLoaded===NLIP) computeIdeal(); }; im.onerror=()=>{ if(++lipsLoaded===NLIP) computeIdeal(); }; im.src='lips/lip'+i+'.png'; }
+
+/* ---- per-cutout geometry from the alpha silhouette: radial profile + commissures ---- */
+const NPRO=48;                                                   // radial samples around the lip
+const ana=document.createElement('canvas'); ana.width=ana.height=160; const actx=ana.getContext('2d',{willReadFrequently:true});
+function lipGeometry(img){
+  const S=160; actx.clearRect(0,0,S,S);
+  const a=img.naturalWidth/img.naturalHeight; let dw=S,dh=S/a; if(dh>S){dh=S;dw=S*a;}    // contain (true aspect)
+  actx.drawImage(img,(S-dw)/2,(S-dh)/2,dw,dh);
+  let dat; try{ dat=actx.getImageData(0,0,S,S).data; }catch(e){ return null; }
+  let cx=0,cy=0,n=0,minx=S,maxx=0; const TH=60;
+  for(let y=0;y<S;y++)for(let x=0;x<S;x++){ if(dat[(y*S+x)*4+3]>TH){ cx+=x;cy+=y;n++; if(x<minx)minx=x; if(x>maxx)maxx=x; } }
+  if(n<50) return null; cx/=n; cy/=n;
+  // commissures = leftmost/rightmost opaque pixel, taken near the lip's vertical centre
+  let lx=S,ly=cy,rx=0,ry=cy;
+  for(let y=0;y<S;y++)for(let x=0;x<S;x++){ if(dat[(y*S+x)*4+3]>TH){ if(Math.abs(y-cy)<S*0.18){ if(x<lx){lx=x;ly=y;} if(x>rx){rx=x;ry=y;} } } }
+  // radial profile: max opaque radius per angle
+  const prof=new Float32Array(NPRO); let pm=0;
+  for(let i=0;i<NPRO;i++){ const ang=i/NPRO*6.28318, ca=Math.cos(ang), sa=Math.sin(ang); let rmax=2;
+    for(let r=2;r<S*0.62;r+=1){ const x=Math.round(cx+ca*r), y=Math.round(cy+sa*r); if(x<0||x>=S||y<0||y>=S) break; if(dat[(y*S+x)*4+3]>TH) rmax=r; }
+    prof[i]=rmax; pm+=rmax; }
+  pm/=NPRO; for(let i=0;i<NPRO;i++) prof[i]/=pm;                 // scale-normalised
+  return { prof, comm:[[(lx-(S-dw)/2)/dw,(ly-(S-dh)/2)/dh],[(rx-(S-dw)/2)/dw,(ry-(S-dh)/2)/dh]] };  // commissures in 0..1 image space
+}
+/* ---- the IDEAL: mean profile (→ ghost ring) + commissure-aligned warped average flesh ---- */
+let idealProf=null, idealReady=false, idealRingN=null; const idealCv=document.createElement('canvas'); idealCv.width=560; idealCv.height=380; const ictx=idealCv.getContext('2d',{willReadFrequently:true});
+function computeIdeal(){
+  const imgs=lipImgs.filter(Boolean); const geos=[]; const mean=new Float32Array(NPRO);
+  for(const im of imgs){ const g=lipGeometry(im); if(g){ geos.push({im,g}); for(let i=0;i<NPRO;i++) mean[i]+=g.prof[i]; } }
+  if(!geos.length){ idealReady=true; return; }
+  for(let i=0;i<NPRO;i++) mean[i]/=geos.length;
+  // light symmetrise the mean profile (mirror angle θ → π-θ and -θ averaged in)
+  const sym=new Float32Array(NPRO);
+  for(let i=0;i<NPRO;i++){ const mi=(NPRO-i)%NPRO; sym[i]=(mean[i]*0.7+mean[mi]*0.3); }
+  idealProf=sym;
+  // warped average flesh — similarity-align each cutout's commissure line to canonical, additive average
+  const W=idealCv.width,H=idealCv.height, d1=[W*0.16,H*0.52], d2=[W*0.84,H*0.52];
+  ictx.clearRect(0,0,W,H); ictx.fillStyle='#000'; ictx.fillRect(0,0,W,H);
+  ictx.globalCompositeOperation='lighter';
+  let used=0;
+  for(const {im,g} of geos){
+    const s1=[g.comm[0][0]*im.naturalWidth, g.comm[0][1]*im.naturalHeight], s2=[g.comm[1][0]*im.naturalWidth, g.comm[1][1]*im.naturalHeight];
+    const sdx=s2[0]-s1[0], sdy=s2[1]-s1[1], ddx=d2[0]-d1[0], ddy=d2[1]-d1[1];
+    const sl=Math.hypot(sdx,sdy)||1, scl=Math.hypot(ddx,ddy)/sl, rot=Math.atan2(ddy,ddx)-Math.atan2(sdy,sdx);
+    const co=Math.cos(rot)*scl, si=Math.sin(rot)*scl;
+    ictx.save();
+    ictx.setTransform(co,si,-si,co, d1[0]-(co*s1[0]-si*s1[1]), d1[1]-(si*s1[0]+co*s1[1]));   // similarity: s1→d1, s2→d2
+    ictx.globalAlpha=1/geos.length;
+    try{ ictx.drawImage(im,0,0); used++; }catch(e){}
+    ictx.restore();
+  }
+  ictx.globalCompositeOperation='source-over'; ictx.globalAlpha=1; ictx.setTransform(1,0,0,1,0,0);
+  try{ const im=ictx.getImageData(0,0,W,H), p=im.data; for(let i=0;i<p.length;i+=4){ for(let c=0;c<3;c++) p[i+c]=clamp((p[i+c]-118)*1.34+118,0,255); } ictx.putImageData(im,0,0); }catch(e){}  // crisp the vermilion + lip line
+  idealRingN=ringFromLumi(idealCv);                              // ghost ring = silhouette of the averaged lip (matches the flesh)
+  idealReady=true; log('ideal from',used,'lips');
+}
+/* lip outline of the averaged flesh (radial from lit centroid) → points normalised to the canvas 0..1 */
+function ringFromLumi(canvas){ const W=canvas.width,H=canvas.height; let dat; try{ dat=canvas.getContext('2d').getImageData(0,0,W,H).data; }catch(e){ return null; }
+  const TH=40; let cx=0,cy=0,nn=0; for(let y=0;y<H;y++)for(let x=0;x<W;x++){ const i=(y*W+x)*4; if((dat[i]+dat[i+1]+dat[i+2])/3>TH){cx+=x;cy+=y;nn++;} } if(nn<80) return null; cx/=nn;cy/=nn;
+  const pts=[]; for(let i=0;i<NPRO;i++){ const ang=i/NPRO*6.28318, ca=Math.cos(ang), sa=Math.sin(ang); let rmax=2;
+    for(let r=2;r<Math.min(W,H)*0.58;r+=1){ const x=Math.round(cx+ca*r), y=Math.round(cy+sa*r); if(x<0||x>=W||y<0||y>=H)break; const j=(y*W+x)*4; if((dat[j]+dat[j+1]+dat[j+2])/3>TH) rmax=r; }
+    pts.push([(cx+ca*rmax)/W,(cy+sa*rmax)/H]); } return pts; }
+function centerScale(P){ let cx=0,cy=0; for(const p of P){cx+=p[0];cy+=p[1];} cx/=P.length;cy/=P.length; let s=0; const c=P.map(p=>[p[0]-cx,p[1]-cy]); for(const p of c)s+=p[0]*p[0]+p[1]*p[1]; s=Math.sqrt(s/P.length)||1; return {c:c.map(p=>[p[0]/s,p[1]/s]),cx,cy,s}; }
+/* draw the ideal flesh contained in R + (optionally) its matched ghost ring */
+function drawIdeal(R,alpha,withRing){ if(!idealReady) return; const a=idealCv.width/idealCv.height; let dw=R.w,dh=R.w/a; if(dh>R.h){dh=R.h;dw=R.h*a;} const ox=R.x+(R.w-dw)/2, oy=R.y+(R.h-dh)/2;
+  xc.save(); xc.globalAlpha=alpha==null?1:alpha; xc.drawImage(idealCv,ox,oy,dw,dh); xc.restore();
+  if(withRing && idealRingN) strokeRing(idealRingN.map(([x,y])=>[ox+x*dw,oy+y*dh]), WHITE,1.4,[5,4]); }
+/* the ideal SHAPE re-fitted onto a live ring's centroid+scale — the morph target for NORMALIZE/ABSENCE */
+function idealRingFit(ring){ if(!idealRingN||!ring) return null; const id=centerScale(idealRingN), lv=centerScale(ring), out=[];
+  for(let i=0;i<ring.length;i++){ const sh=id.c[Math.floor(i/ring.length*idealRingN.length)%idealRingN.length]; out.push([lv.cx+sh[0]*lv.s, lv.cy+sh[1]*lv.s]); } return out; }
+/* live ring → radial profile (its own centroid), for deviation against the ideal */
+function liveProfile(ring){ if(!ring) return null; let cx=0,cy=0; for(const p of ring){cx+=p[0];cy+=p[1];} cx/=ring.length;cy/=ring.length;
+  const prof=new Float32Array(NPRO);
+  for(let i=0;i<NPRO;i++){ const ang=i/NPRO*6.28318, ca=Math.cos(ang), sa=Math.sin(ang);
+    // nearest ring vertex by angle (approx radius at this angle)
+    let bestd=9,br=0.5; for(const p of ring){ const a2=Math.atan2(p[1]-cy,p[0]-cx); let da=Math.abs(a2-ang); if(da>3.14159)da=6.2832-da; if(da<bestd){bestd=da;br=Math.hypot(p[0]-cx,p[1]-cy);} } prof[i]=br; }
+  let m=0; for(let i=0;i<NPRO;i++)m+=prof[i]; m/=NPRO; for(let i=0;i<NPRO;i++)prof[i]/=m; return prof; }
+function deviationSigma(ring){ if(!idealProf||!ring) return 1.327; const lp=liveProfile(ring); if(!lp) return 1.327;
+  let e=0; for(let i=0;i<NPRO;i++){ const dd=lp[i]-idealProf[i]; e+=dd*dd; } return clamp(Math.sqrt(e/NPRO)*6.4, 0, 3.2); }
+
+/* ===========================  STATE MACHINE — 7 beats, presence-driven  =========================== */
+const S={THRESHOLD:0,RECOGNITION:1,EXCHANGE:2,GRADING:3,IDEAL_ALONE:4,NORMALIZE:5,ABSENCE:6};
+const NAME=Object.keys(S);
+const DUR={ [S.RECOGNITION]:4.0,[S.EXCHANGE]:7.0,[S.GRADING]:6.5,[S.IDEAL_ALONE]:5.0,[S.NORMALIZE]:9.0,[S.ABSENCE]:6.0 };
+let state=S.THRESHOLD, st=0, frozen=false, capAmt=0, normAmt=0, devSigma=1.327, devShown=1.327, centerX=0.5, scaleX=1, mouthAlpha=0, leanX=0;
+function enter(ns){ state=ns; st=0;
+  if(ns===S.GRADING){ frozen=true; snapshotCapture(); devSigma=deviationSigma(capRing); devShown=devSigma; }
+  if(ns===S.THRESHOLD){ frozen=false; normAmt=0; capAmt=0; capRing=null; }
+}
+function tick(dt, now){
+  st+=dt;
+  const held=DEBUG && window.__holdState===state;
+  if(DEBUG && window.__holdState===state && window.__holdK!=null && DUR[state]) st=window.__holdK*DUR[state];
+  const seen=(now-lastSeen)<300; presence=lerp(presence, seen?1:0, 1-Math.exp(-(seen?5:1.4)*dt));
+  const k=DUR[state]?clamp(st/DUR[state],0,1):0;
+  let tCap=capAmt, tNorm=normAmt, tCx=centerX, tScl=scaleX, tAlpha=mouthAlpha;
+  const gone=presence<0.25, here=presence>0.6;
+  switch(state){
+    case S.THRESHOLD: tAlpha=0; tCap=0; tNorm=0; tCx=0.5; tScl=1;
+      if(!held && here && st>1.2) enter(S.RECOGNITION); break;
+    case S.RECOGNITION: tAlpha=lerp(mouthAlpha,1,1-Math.exp(-3*dt)); tCx=0.5; tScl=1; tCap=0; tNorm=0;
+      if(!held){ if(gone) enter(S.ABSENCE); else if(st>=DUR[state]) enter(S.EXCHANGE); } break;
+    case S.EXCHANGE: tAlpha=1; tCx=0.5; tScl=1; tCap=0; tNorm=0;
+      if(!held){ if(gone) enter(S.ABSENCE); else if(st>=DUR[state]) enter(S.GRADING); } break;
+    case S.GRADING: tAlpha=1; tCap=lerp(capAmt,1,1-Math.exp(-3*dt)); tNorm=0;
+      tCx=lerp(0.5,0.28,smoothstep(0,0.6,k)); tScl=lerp(1,0.66,smoothstep(0,0.6,k));     // slide LEFT, IDEAL on the RIGHT
+      if(!held){ if(gone) enter(S.ABSENCE); else if(st>=DUR[state]) enter(S.IDEAL_ALONE); } break;
+    case S.IDEAL_ALONE: tAlpha=lerp(mouthAlpha,0,1-Math.exp(-5*dt)); tCap=1;             // the ideal alone — live mouth gone
+      if(!held){ if(st>=DUR[state]) enter(S.NORMALIZE); } break;
+    case S.NORMALIZE: tAlpha=lerp(mouthAlpha,1,1-Math.exp(-5*dt)); tCx=0.5; tScl=1; tCap=1; tNorm=clamp(k,0,1); devShown=devSigma*(1-smoothstep(0,1,k));
+      if(!held){ if(gone) enter(S.ABSENCE); else if(st>=DUR[state]) enter(S.ABSENCE); } break;
+    case S.ABSENCE: tAlpha=lerp(mouthAlpha,0,1-Math.exp(-4*dt)); tCap=1;
+      if(!held && st>=DUR[state]) enter(S.THRESHOLD); break;
+  }
+  capAmt=tCap; normAmt=tNorm; centerX=tCx; scaleX=tScl; mouthAlpha=tAlpha;
+  if(state!==S.NORMALIZE) devShown=lerp(devShown, (state===S.THRESHOLD||state===S.RECOGNITION)?devShown:devSigma, 1-Math.exp(-6*dt));
+  // live deviation while exchanging/recognising
+  if(state===S.EXCHANGE||state===S.RECOGNITION){ const d=deviationSigma(liveRing); devSigma=lerp(devSigma,d,1-Math.exp(-3*dt)); devShown=devSigma; }
+  if(state===S.ABSENCE) devShown=lerp(devShown, 1.6+0.4*Math.sin(now*0.001), 1-Math.exp(-4*dt));   // spikes back up
+}
+
+/* ===========================  RENDER  =========================== */
+const meatOn=()=> state!==S.THRESHOLD && state!==S.IDEAL_ALONE;
+let prevT=performance.now()*0.001, startT=prevT, T=0;
+function frame(){
+  const now=performance.now(), t=now*0.001; let dt=t-prevT; prevT=t; if(dt>0.05)dt=0.05; T=t-startT;
+  readMouth(now); updateCrop(); tick(dt, now);
+  gl.clearColor(0.012,0.004,0.009,1.0); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.uniform1f(u.time,T); gl.uniform1f(u.hasCrop,hasCrop); gl.uniform1f(u.aspect,frozen?stillAspect:cropAspect);
+  gl.uniform1f(u.capture,capAmt); gl.uniform1f(u.norm,normAmt); gl.uniform1f(u.centerX,centerX); gl.uniform1f(u.scale,scaleX);
+  gl.uniform1f(u.alpha, meatOn()?mouthAlpha:0);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+
+  xc.clearRect(0,0,sizePx,sizePx);
+  const k=DUR[state]?clamp(st/DUR[state],0,1):0;
+  if(state===S.THRESHOLD) drawThreshold();
+  else if(state===S.RECOGNITION) drawRecognition(k);
+  else if(state===S.EXCHANGE) drawExchange(k);
+  else if(state===S.GRADING) drawGrading(k);
+  else if(state===S.IDEAL_ALONE) drawIdealAlone(k);
+  else if(state===S.NORMALIZE) drawNormalize(k);
+  else if(state===S.ABSENCE) drawAbsence(k);
+  drawDbg();
+  requestAnimationFrame(frame);
+}
+
+/* ---------- overlay helpers ---------- */
+function ctext(s,x,y,o){ o=o||{}; const size=o.size||9, col=o.col||CYAN, w=o.w||400, align=o.align||'left', fam=o.fam||("'PP Fraktion Mono',monospace");
+  xc.save(); xc.font=(w===700?'700 ':'')+size+'px '+fam; xc.textAlign=align; xc.textBaseline='alphabetic';
+  if(o.cap){ xc.fillStyle='#000'; for(const off of [[-1,0],[1,0],[0,-1],[0,1]]) xc.fillText(s,x+off[0],y+off[1]); }
+  xc.fillStyle=col; xc.fillText(s,x,y); xc.restore(); }
+function strokeRing(P,style,wd,dash){ if(!P)return; xc.save(); if(dash)xc.setLineDash(dash); xc.strokeStyle=style; xc.lineWidth=wd;
+  xc.beginPath(); P.forEach((p,i)=> i?xc.lineTo(p[0],p[1]):xc.moveTo(p[0],p[1])); xc.closePath(); xc.stroke(); xc.restore(); }
+function ringPx(ring,R){ return ring? ring.map(([uu,v])=>[R.x+uu*R.w,R.y+v*R.h]) : null; }
+function reticle(R){ const cx=R.x+R.w/2, cy=R.y+R.h/2, g=13; xc.save(); xc.strokeStyle=CY+'0.7)'; xc.lineWidth=1;
+  xc.beginPath(); xc.moveTo(cx-40,cy); xc.lineTo(cx-g,cy); xc.moveTo(cx+g,cy); xc.lineTo(cx+40,cy); xc.moveTo(cx,cy-40); xc.lineTo(cx,cy-g); xc.moveTo(cx,cy+g); xc.lineTo(cx,cy+40); xc.stroke(); xc.restore(); }
+const SH=()=>{ let h=''; for(let i=0;i<6;i++)h+='ABCDEF0123456789'[Math.floor(rnd(i+Math.floor(T*0.3))*16)]; return h; };
+
+/* ---------- the collective mass — real lip cutouts, independent parallax, lean, beat-late echo ---------- */
+const MASS=Array.from({length:22},(_,i)=>({ idx:i%NLIP, a:rnd(i*1.3)*6.28, rad:0.10+rnd(i*2.1)*0.34, ph:rnd(i*3.7)*6.28, sp:0.10+rnd(i*1.9)*0.16, sc:0.16+rnd(i*4.3)*0.16, ec:rnd(i)>0.93 }));
+function drawLipFeathered(im,cx,cy,w,h,al,open){ if(!im) return; moc.clearRect(0,0,256,256);
+  const a=im.naturalWidth/im.naturalHeight; let dw=256,dh=256/a; if(dh>256){dh=256;dw=256*a;}
+  moc.drawImage(im,(256-dw)/2,(256-dh)/2,dw,dh);
+  if(open>0.01){ moc.save(); moc.globalCompositeOperation='source-over'; moc.fillStyle='rgba(20,2,8,'+open+')'; moc.fillRect(0,128-open*16,256,open*32); moc.restore(); }
+  moc.globalCompositeOperation='destination-in'; const g=moc.createRadialGradient(128,128,30,128,128,140);
+  g.addColorStop(0,'#000');g.addColorStop(0.62,'#000');g.addColorStop(1,'rgba(0,0,0,0)'); moc.fillStyle=g; moc.fillRect(0,0,256,256); moc.globalCompositeOperation='source-over';
+  xc.save(); xc.globalAlpha=al; xc.drawImage(mo,0,0,256,256, cx-w/2,cy-h/2,w,h); xc.restore(); }
+const mo=document.createElement('canvas'); mo.width=mo.height=256; const moc=mo.getContext('2d');
+function drawMass(focus, alpha, leanTo){
+  const S=sizePx; for(const m of MASS){ const im=lipImgs[m.idx]; if(!im) continue;
+    let ang=m.a + T*m.sp*0.25;                                  // slow independent drift
+    let cx=S*(0.5+Math.cos(ang)*m.rad)+Math.sin(T*m.sp+m.ph)*S*0.02;   // independent parallax
+    let cy=S*(0.5+Math.sin(ang)*m.rad*0.92)+Math.cos(T*m.sp*0.8+m.ph)*S*0.02;
+    if(leanTo){ cx=lerp(cx, leanTo[0], 0.30); cy=lerp(cy, leanTo[1], 0.30); }   // lean toward the live mouth
+    let op=0; if(m.ec) op=clamp(openAmt-0.15,0,1)*Math.max(0,Math.sin((T-0.45)*3.0));  // ONE cutout echoes the open, a beat late
+    const w=S*m.sc, h=w*0.66;
+    drawLipFeathered(im,cx,cy,w,h, alpha*(0.5+0.5*Math.sin(ang*1.3)), op);
+  }
+}
+
+function drawThreshold(){ const R=mouthRect(); reticle(R); ctext('AWAITING SUBJECT', sizePx/2, sizePx*0.86, {size:9,col:CY+'0.45)',align:'center'}); }
+function drawRecognition(k){ const R=mouthRect(centerX,scaleX);
+  const ring=ringPx(liveRing,R); if(ring) strokeRing(ring, CY+(0.3+0.5*k)+')', 1.2);     // contour floats
+  ctext('ONE', sizePx/2, sizePx*0.30, {size:Math.round(sizePx*0.09),col:WHITE,align:'center',cap:true}); }
+function drawExchange(k){ const R=mouthRect();
+  const ring=ringPx(liveRing,R); reticle(R);
+  if(ring){ strokeRing(ring, CY+'0.85)',1.2); for(let i=0;i<ring.length;i+=2){ const p=ring[i]; xc.strokeStyle=CY+'0.5)'; xc.lineWidth=1; xc.beginPath(); xc.moveTo(p[0]-3,p[1]); xc.lineTo(p[0]+3,p[1]); xc.moveTo(p[0],p[1]-3); xc.lineTo(p[0],p[1]+3); xc.stroke();
+    if(i%3===0) ctext((rnd(i+Math.floor(T*4))*9.9).toFixed(2), p[0]+4, p[1]-2, {size:6,col:CY+'0.55)'}); } }
+  // dancing measurements on the live flesh — DEVIATION FROM IDEAL ticking
+  ctext('QC · LIVE', R.x, R.y-8, {size:8,col:CY+'0.6)'});
+  ctext('DEVIATION FROM IDEAL', sizePx/2, sizePx-46, {size:8,col:CY+'0.7)',align:'center'});
+  ctext(devShown.toFixed(3)+'σ', sizePx/2, sizePx-22, {size:16,col:WHITE,w:700,align:'center',cap:true}); }
+function drawGrading(k){
+  const R=mouthRect(centerX,scaleX);                            // live mouth slid LEFT (GL renders it there)
+  const ring=ringPx(liveRing&&frozen?capRing:liveRing,R); if(ring) strokeRing(ring, CY+'0.85)',1.2);
+  ctext('GRADE · LIVE', R.x, R.y-7, {size:8,col:CY+'0.6)'});
+  // the IDEAL on the RIGHT — ghost flesh + ghost contour, present and labelled
+  const IR={x:sizePx*0.53, y:sizePx*0.28, w:sizePx*0.42, h:sizePx*0.44};
+  drawIdeal(IR, 0.95, true);
+  ctext('IDEAL · 0.0σ', IR.x, IR.y-7, {size:8,col:WHITE,cap:true});
+  // a thin centre divider
+  xc.save(); xc.strokeStyle=CY+'0.25)'; xc.lineWidth=1; xc.setLineDash([4,5]); xc.beginPath(); xc.moveTo(sizePx*0.5,sizePx*0.18); xc.lineTo(sizePx*0.5,sizePx*0.82); xc.stroke(); xc.restore();
+  // THE GAP — the largest, most central element
+  ctext('CORRECTION REQUIRED', sizePx/2, sizePx*0.90, {size:11,col:CY+'0.8)',align:'center',cap:true});
+  ctext(Math.round(devShown/3.2*100)+'%', sizePx/2, sizePx*0.135, {size:Math.round(sizePx*0.085),col:WHITE,w:700,align:'center',cap:true});
+}
+function drawIdealAlone(k){
+  drawIdeal({x:sizePx*0.15,y:sizePx*0.22,w:sizePx*0.70,h:sizePx*0.56}, clamp(k*3,0,1), true);
+  ctext('IDEAL', sizePx/2, sizePx*0.16, {size:Math.round(sizePx*0.05),col:WHITE,w:700,align:'center',cap:true});
+  ctext('MEAN OF ALL  ·  BELONGS TO NO ONE', sizePx/2, sizePx*0.86, {size:10,col:CY+'0.85)',align:'center',cap:true});
+  ctext('0.0σ', sizePx/2, sizePx*0.90, {size:10,col:WHITE,align:'center',cap:true}); }
+function drawNormalize(k){
+  const R=mouthRect(); const cur=(()=>{ const lr=ringPx(capRing,R); if(!lr) return null; const ir=idealRingFit(lr); if(!ir) return null;
+    return lr.map((p,i)=>[lerp(p[0],ir[i][0],k),lerp(p[1],ir[i][1],k)]); })();
+  if(cur) strokeRing(cur, lerp1(CY,k), 1.3);
+  reticle(R);
+  ctext('CORRECTION IN PROGRESS', sizePx/2, sizePx*0.10, {size:10,col:CY+'0.8)',align:'center',cap:true});
+  ctext('Δ '+devShown.toFixed(3)+'σ', sizePx/2, sizePx*0.145, {size:Math.round(sizePx*0.06),col:WHITE,w:700,align:'center',cap:true});
+  ctext('→ 0.0', sizePx/2, sizePx*0.90, {size:12,col:CY+'0.7)',align:'center',cap:true}); }
+function lerp1(base,k){ return 'rgba('+Math.round(lerp(0,255,k))+',255,'+Math.round(lerp(204,255,k))+',0.9)'; }
+function drawAbsence(k){
+  const R=mouthRect();                                        // the void where the viewer's lips were — a PENDING RECORD fading to the ideal
+  const lr=ringPx(capRing,R); const ir=lr?idealRingFit(lr):null; let v=null;
+  if(lr&&ir){ const m=smoothstep(0,1,k)*0.6; v=lr.map((p,i)=>[lerp(p[0],ir[i][0],m),lerp(p[1],ir[i][1],m)]); }
+  if(v){ xc.save(); xc.fillStyle='rgba(0,0,0,0.55)'; xc.beginPath(); v.forEach((p,i)=>i?xc.lineTo(p[0],p[1]):xc.moveTo(p[0],p[1])); xc.closePath(); xc.fill(); xc.restore();
+    strokeRing(v, CY+(0.4)+')', 1.2, [4,4]); }
+  ctext('PENDING RECORD', sizePx/2, sizePx*0.12, {size:11,col:WHITE,w:700,align:'center',cap:true});
+  ctext('ENROLLED · AWAITING CORRECTION', sizePx/2, sizePx*0.155, {size:9,col:CY+'0.75)',align:'center',cap:true});
+  ctext('DEVIATION FROM IDEAL  '+devShown.toFixed(3)+'σ', sizePx/2, sizePx-44, {size:9,col:CY+'0.7)',align:'center'}); }
+
+const dbg=document.getElementById('encdbg');
+function drawDbg(){ if(!DEBUG){ dbg.textContent=''; return; }
+  dbg.textContent='['+NAME[state]+' '+st.toFixed(1)+'s] cam:'+(camOK?'OK':'NO')+' face:'+faceCount+' pres:'+presence.toFixed(2)+' open:'+openAmt.toFixed(2)+' dev:'+devShown.toFixed(2)+'σ norm:'+normAmt.toFixed(2)+' ideal:'+(idealReady?'Y':'…'); }
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

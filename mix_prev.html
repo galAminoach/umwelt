@@ -1,0 +1,1272 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>UMWELT — vision</title>
+<style>
+  @font-face{ font-family:'PP Fraktion Mono'; src:url('fonts/PPFraktionMono-Regular.otf') format('opentype'); font-weight:400; font-display:swap; }
+  @font-face{ font-family:'PP Fraktion Mono'; src:url('fonts/PPFraktionMono-Bold.otf') format('opentype'); font-weight:700; font-display:swap; }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;background:#000;overflow:hidden}
+  body{ display:flex;align-items:center;justify-content:center; background:#000; }
+  /* the screen is the Umwelt of a cold vision system: black cage, warm wet meat pinned inside it */
+  .stage{ position:relative; width:min(94vmin,900px); height:min(94vmin,900px); overflow:hidden; background:#000;
+    box-shadow:0 0 0 1px rgba(0,255,204,0.10), 0 0 60px 8px rgba(0,40,36,0.30), inset 0 0 160px 14px rgba(0,0,0,0.92); }
+  canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+  #bg{z-index:1} #gl{z-index:2} #fx{z-index:3}
+  .glass{ position:absolute;inset:0;z-index:4;pointer-events:none;
+    background:radial-gradient(140% 140% at 50% 48%, rgba(0,0,0,0) 62%, rgba(0,0,0,0.55) 100%); mix-blend-mode:multiply; }
+  #umhud{position:absolute;top:6px;left:8px;z-index:6;font:11px 'PP Fraktion Mono',monospace;color:#00ffcc;text-shadow:0 0 4px #000;white-space:pre;pointer-events:none}
+  video{position:absolute;width:2px;height:2px;opacity:0;pointer-events:none;left:-10px;top:-10px}
+</style>
+</head>
+<body>
+  <div class="stage" id="stage">
+    <canvas id="bg"></canvas>
+    <canvas id="gl"></canvas>
+    <canvas id="fx"></canvas>
+    <div class="glass"></div>
+    <div id="umhud"></div>
+    <video id="vid" playsinline muted></video>
+    <audio id="snd" src="audio/flow.wav" loop preload="auto"></audio>
+  </div>
+
+<script type="module">
+import { FaceLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const cv=document.getElementById('gl');
+const gl=cv.getContext('webgl2',{alpha:false});
+const fxc=document.getElementById('fx'); const xc=fxc.getContext('2d');
+const bgcv=document.getElementById('bg'); const bgc=bgcv.getContext('2d');
+const vid=document.getElementById('vid');
+if(!gl) throw new Error('no webgl2');
+
+/* ---------- sound bed for the flow (looped) ---------- */
+const snd=document.getElementById('snd'); snd.volume=0.9;
+let audioOn=false;
+function startAudio(){ if(audioOn) return; const p=snd.play(); if(p&&p.then) p.then(()=>{audioOn=true;}).catch(()=>{}); else audioOn=true; }
+startAudio();                                                   // try autoplay (kiosk: launch Chrome with --autoplay-policy=no-user-gesture-required)
+for(const ev of ['pointerdown','keydown','touchstart']) window.addEventListener(ev, startAudio);  // else unlock on first gesture
+/* region selection: TAP a region name (touch/iPad) confirms it; the live mouth-open also confirms the highlighted region; keys 1·2·3 remain an operator aid */
+window.addEventListener('keydown', e=>{ if(state!==S.SELECT) return; const m={'1':0,'2':1,'3':2};
+  if(e.key in m){ selHighlight=m[e.key]; } else if(e.key==='Enter'||e.key===' '){ selectPart(PART_ORDER[selHighlight]); e.preventDefault(); } });
+fxc.addEventListener('pointerdown', e=>{ if(state!==S.SELECT || forcePart) return; const r=fxc.getBoundingClientRect(); if(!r.width) return;
+  const sz=sizePx, x=(e.clientX-r.left)/r.width*sz, y=(e.clientY-r.top)/r.height*sz, oW=sz*0.20, ox=sz/2-(PART_ORDER.length*oW)/2, oy=sz*0.775;
+  if(y>oy-sz*0.03 && y<oy+sz*0.03){ for(let i=0;i<PART_ORDER.length;i++){ const cx0=ox+i*oW; if(x>=cx0 && x<=cx0+oW){ selHighlight=i; selectPart(PART_ORDER[i]); e.preventDefault(); return; } } } });
+const clamp=(x,a,b)=>Math.max(a,Math.min(b,x)), lerp=(a,b,t)=>a+(b-a)*t;
+const smoothstep=(a,b,x)=>{const t=clamp((x-a)/(b-a),0,1);return t*t*(3-2*t);};
+const DEBUG=location.search.includes('debug');
+/* COLD palette — the machine's territory. The meat (GL) stays warm; everything 2D is cold cyan/white. */
+const CYAN='#00ffcc', CY='rgba(0,255,204,', WHITE='#ffffff';
+const MAG=CYAN, MG=CY;                                         // measurements are CYAN (the pink accent was dropped); MAG/MG kept as one-line swap points
+
+/* ===== the mouth — warm wet living meat (live) → fixed specimen (capture).
+   The cold gaze chills it where it scans (uScanY) and leaves a permanent residual (uChill). ===== */
+const VERT=`#version 300 es
+in vec2 c; out vec2 uv; void main(){ uv=c*0.5+0.5; gl_Position=vec4(c,0.,1.); }`;
+const FRAG=`#version 300 es
+precision highp float; in vec2 uv; out vec4 O;
+uniform sampler2D uMouth; uniform float uTime,uHasCrop,uAspect,uCapture,uInflate,uScanY,uChill,uStretch,uFace,uWet,uCenterX,uScale;
+float hash(vec2 p){ p=fract(p*vec2(123.34,456.21)); p+=dot(p,p+45.32); return fract(p.x*p.y); }
+// the operating-table / inside-the-DB graticule: dim, DEAD, behind the meat.
+// anisotropic — dense ruled record-rows (horizontal) + sparse barrel-curved meridians (vertical).
+vec3 graticule(vec2 p){
+  vec2 q=p-0.5; float bar=0.06;                                  // barely-there barrel on the meridians only
+  float mx=q.x*(1.0+bar*(q.y*q.y*4.0-q.x*q.x));
+  float rows=fract(p.y/0.026);                                   // ledger rows ~ every 0.026
+  float rl=smoothstep(0.5,0.0,abs(rows-0.5)*2.0-0.93);
+  float fifth=(mod(floor(p.y/0.026),5.0)<0.5)?1.0:0.0;           // every 5th row brighter
+  float mer=fract((mx+0.5)/0.085);                               // sparse meridians ~ every 0.085
+  float ml=smoothstep(0.5,0.0,abs(mer-0.5)*2.0-0.96);
+  float g=rl*(0.06+0.07*fifth)+ml*0.05;
+  return vec3(0.0,0.85,0.72)*g;                                  // dim teal-cyan
+}
+float vnoise(vec2 p){ vec2 i=floor(p),f=fract(p); f=f*f*(3.-2.*f);
+  float a=hash(i),b=hash(i+vec2(1,0)),c=hash(i+vec2(0,1)),d=hash(i+vec2(1,1));
+  return mix(mix(a,b,f.x),mix(c,d,f.x),f.y); }
+float fbm(vec2 p){ float s=0.,a=.5; for(int i=0;i<4;i++){ s+=a*vnoise(p); p*=2.04; a*=.5;} return s; }
+vec3 wet3(vec3 col){ col=pow(max(col,0.),vec3(1.06)); vec3 wine=vec3(0.5,0.07,0.17); return mix(col, col*wine*2.6, 0.15); }
+void main(){
+  vec2 p=uv;
+  float scl=(uScale<=0.0)?1.0:uScale;
+  vec2 box=vec2(0.40*scl*(1.0+uStretch*0.55), 0.40/max(uAspect,1.0)*scl*(1.0-uStretch*0.10));  // STRESS: caliper pulls width · uScale: GRADING shrink
+  vec2 d=(p-vec2((uCenterX<=0.0)?0.5:uCenterX,0.5))/box;
+  float t=uTime; float cap=clamp(uCapture,0.0,1.0);
+  // faint life only — no psychedelic loop; the meat breathes, the cold gaze does the moving
+  vec2 flow=vec2(fbm(d*3.2+t*0.25), fbm(d*3.2 - t*0.20+7.0))-0.5;
+  float wet=clamp(uWet,0.0,1.0);                                 // 0 = sharp lip cutout · 1 = deliberately-wet membrane (ramped, never a hard cut)
+  float live=0.020*wet;                                          // wobble only as it wets
+  vec2 dd=d + flow*live;
+  vec2 cuv=clamp(dd*0.5+0.5,0.0,1.0);
+  cuv = clamp(0.5 + (cuv-0.5)/(1.0+uInflate*vec2(0.30,0.74)), 0.0, 1.0);   // NORMALIZE: meat pulled toward mean volume
+  vec3 ground=vec3(0.0);                                         // plain black ground (grid removed)
+  vec3 flesh;
+  if(uHasCrop>0.5){
+    vec3 c0=texture(uMouth,cuv).rgb;
+    vec2 e=1.8/vec2(textureSize(uMouth,0)), e2=4.2/vec2(textureSize(uMouth,0));  // multi-scale unsharp ALWAYS — fights low-res webcam softness
+    vec3 bl=(texture(uMouth,cuv+vec2(e.x,0.0)).rgb+texture(uMouth,cuv-vec2(e.x,0.0)).rgb
+            +texture(uMouth,cuv+vec2(0.0,e.y)).rgb+texture(uMouth,cuv-vec2(0.0,e.y)).rgb)*0.25;
+    vec3 bl2=(texture(uMouth,cuv+vec2(e2.x,0.0)).rgb+texture(uMouth,cuv-vec2(e2.x,0.0)).rgb
+             +texture(uMouth,cuv+vec2(0.0,e2.y)).rgb+texture(uMouth,cuv-vec2(0.0,e2.y)).rgb)*0.25;
+    float shp=mix(2.6,0.2,wet)+cap*1.2;                         // sharp when not wet; extra crunch on capture; softens only as wet ramps
+    c0=c0+(c0-bl)*shp + (c0-bl2)*shp*0.45;                      // fine + coarse detail
+    c0=mix(c0,(c0-0.5)*(1.0+0.42*(1.0-wet))+0.5, 0.7);
+    flesh=clamp(c0,0.0,1.0);
+  } else flesh=vec3(0.30,0.06,0.12);
+  flesh=mix(flesh, wet3(flesh), 0.42);                          // warm wine grade (colour, NOT blur) — always on
+  float sheen=pow(max(0.0,1.0-length(d*vec2(0.8,1.2))),3.0);
+  flesh+=sheen*vec3(1.0,0.9,0.94)*(0.16+0.12*wet);             // wet sheen grows with wetness
+  // --- the gaze chills the meat: desaturate toward grey-cyan under the scan + a permanent residual ---
+  float chill=clamp(uChill,0.0,1.0);
+  if(uScanY>=0.0){ float passed=smoothstep(uScanY+0.02, uScanY-0.22, p.y); chill=max(chill, passed*0.55); }
+  float g=dot(flesh,vec3(0.299,0.587,0.114));
+  vec3 cold=mix(vec3(g), vec3(0.55,0.86,0.86)*g*1.25, 0.55);
+  flesh=mix(flesh, cold, chill);
+  // membrane mask
+  vec2 dM=d/(1.0+uInflate*vec2(0.28,0.60));
+  float r=length(dM*vec2(0.80,1.0));
+  r += (fbm(uv*3.4+t*0.18)-0.5)*0.12*wet;                       // edge only ripples once wet
+  float lo=mix(0.86,0.46,wet), hi=1.01;                         // tight crisp silhouette when sharp → soft membrane as it wets
+  float mask=smoothstep(hi,lo,r)*(1.0-clamp(uFace,0.0,1.0));     // uFace=1 → grid only (the meat is replaced/absent)
+  vec3 col=mix(ground, flesh, mask);
+  float vig=smoothstep(1.6,0.35,length((p-0.5)*2.0)); col*=0.62+0.38*vig;
+  col+=(hash(p*vec2(900.0)+t)-0.5)*0.008;
+  O=vec4(max(col,0.0),1.0);
+}`;
+function sh(ty,src){ const s=gl.createShader(ty); gl.shaderSource(s,src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+const prog=gl.createProgram(); gl.attachShader(prog,sh(gl.VERTEX_SHADER,VERT)); gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,FRAG));
+gl.linkProgram(prog); if(!gl.getProgramParameter(prog,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+const quad=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,quad);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+const cl=gl.getAttribLocation(prog,'c'); gl.enableVertexAttribArray(cl); gl.vertexAttribPointer(cl,2,gl.FLOAT,false,0,0);
+const U=(n)=>gl.getUniformLocation(prog,n);
+const u={ mouth:U('uMouth'),time:U('uTime'),hasCrop:U('uHasCrop'),aspect:U('uAspect'),capture:U('uCapture'),inflate:U('uInflate'),scanY:U('uScanY'),chill:U('uChill'),stretch:U('uStretch'),face:U('uFace'),wet:U('uWet'),centerX:U('uCenterX'),scale:U('uScale') };
+gl.uniform1i(u.mouth,0);
+const mouthTex=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,mouthTex);
+for(const pn of [gl.TEXTURE_WRAP_S,gl.TEXTURE_WRAP_T]) gl.texParameteri(gl.TEXTURE_2D,pn,gl.CLAMP_TO_EDGE);
+for(const pn of [gl.TEXTURE_MIN_FILTER,gl.TEXTURE_MAG_FILTER]) gl.texParameteri(gl.TEXTURE_2D,pn,gl.LINEAR);
+
+let DPR=Math.min(window.devicePixelRatio||1,1.5), sizePx=900;
+function resize(){ const r=cv.getBoundingClientRect(); sizePx=r.width||900;
+  cv.width=fxc.width=bgcv.width=Math.round(sizePx*DPR); cv.height=fxc.height=bgcv.height=Math.round(sizePx*DPR);
+  gl.viewport(0,0,cv.width,cv.height); xc.setTransform(DPR,0,0,DPR,0,0); bgc.setTransform(DPR,0,0,DPR,0,0); }
+window.addEventListener('resize',resize); resize();
+
+/* mouth display rect on the 2D overlay (matches the shader's box mapping) */
+function mouthRect(){ const bx=0.40, by=0.40/Math.max(stillAspect,1.0);
+  return { x:(0.5-bx)*sizePx, y:(0.5-by)*sizePx, w:2*bx*sizePx, h:2*by*sizePx }; }
+function INSET(){ return sizePx*0.052; }                                   // the cold cage: ~47px @900
+/* ONE type scale (5 steps, proportional to the square) + ONE banner grid — every screen shares these so the layout reads as a single instrument.
+   micro=annotation · label=chrome/labels · body=voice · title=screen name · hero=the one dominant word/number */
+function TZ(){ const S=sizePx; return { micro:Math.max(7,Math.round(S*0.0089)), label:Math.round(S*0.0122), body:Math.round(S*0.0167), title:Math.round(S*0.0244), hero:Math.round(S*0.058) }; }
+const GY={ banner:0.125, subline:0.158, subject:0.205, footVoice:0.955 };  // shared vertical anchors (fractions of the square)
+function screenBanner(title, sub){ const S=sizePx, t=TZ();                  // identical header block on every screen — WHITE headline, cyan sub
+  ctext(title, S/2, S*GY.banner, {size:t.title,col:WHITE,cap:true,align:'center',track:2.5});
+  if(sub) ctext(sub, S/2, S*GY.subline, {size:t.label,col:CY+'0.55)',cap:true,align:'center',track:2}); }
+
+/* ---------- crop the live video to the lips ---------- */
+const cropCv=document.createElement('canvas'); const cctx=cropCv.getContext('2d');
+let hasCrop=0, cropAspect=1.7, stillAspect=1.7;
+function updateCrop(){
+  if(frozen) return;
+  if(!camOK||vid.readyState<2||!vid.videoWidth) return;
+  const vw=vid.videoWidth,vh=vid.videoHeight; const sw=2*vidCrop.hx*vw, sh=2*vidCrop.hy*vh; if(sw<4||sh<4) return;
+  cropAspect=clamp(sw/sh,1.0,3.0); cropCv.width=1024; cropCv.height=Math.max(2,Math.round(1024/cropAspect));   // higher-res crop → sharp cutout, not a smear
+  cctx.save(); cctx.translate(cropCv.width,0); cctx.scale(-1,1);
+  try{ cctx.drawImage(vid,(vidCrop.cx-vidCrop.hx)*vw,(vidCrop.cy-vidCrop.hy)*vh,sw,sh,0,0,cropCv.width,cropCv.height); }catch(e){ cctx.restore(); return; }
+  cctx.restore();
+  gl.bindTexture(gl.TEXTURE_2D,mouthTex); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,cropCv); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false); hasCrop=1;
+}
+/* live lip ring (crop-normalised, top-down) — used for the isolation contour + measurement */
+function ringFromLM(L){ return ringOf(L, curPart); }                          // the live ring of whatever part is selected
+let capLip=null, liveRing=null;
+function snapshotCapture(){
+  stillAspect=cropAspect; capLip=ringFromLM(lastLM);
+  if(capLip){ if(curPart===PART.LIPS) updateMean(capLip);                    // lips grow the designed mean
+    else curPart.idealNorm=symmetrize(centerScale(capLip));                  // nose/eyes: the symmetric form becomes the ideal
+    devPct=deviationOf(capLip); }
+  count++; localStorage.setItem(COUNT_KEY,String(count));
+}
+
+/* ---------- the honest AVERAGE (computed, not invented) ----------
+   Shape-only (translation+scale invariant) mean of every lip ring the system has seen.
+   Seeded with a canonical reference corpus so "the mean" exists from frame one; each visitor updates it. */
+function centerScale(ring){ let cx=0,cy=0; for(const[x,y]of ring){cx+=x;cy+=y;} cx/=ring.length;cy/=ring.length;
+  let s=0; const c=ring.map(([x,y])=>{const dx=x-cx,dy=y-cy; s+=dx*dx+dy*dy; return [dx,dy];}); s=Math.sqrt(s/ring.length)||1;
+  return c.map(([dx,dy])=>[dx/s,dy/s]); }                                    // centroid 0, RMS radius 1
+/* realistic outer-lip ring in LIPS winding (normalised lip-bbox coords) — a true average lip shape.
+   x is mirrored (1-x) to match the selfie-mirrored display rings (ringFromLM uses uX=1-...). */
+const CANON=centerScale([
+  [0.00,0.50],[0.12,0.32],[0.22,0.22],[0.31,0.17],[0.42,0.14],[0.50,0.16],[0.58,0.14],[0.69,0.17],[0.78,0.22],[0.88,0.32],[1.00,0.50],
+  [0.88,0.66],[0.78,0.76],[0.69,0.82],[0.58,0.85],[0.50,0.86],[0.42,0.85],[0.31,0.82],[0.22,0.76],[0.12,0.66] ].map(([x,y])=>[1-x,y]));
+const MEAN_KEY='umwelt.vision.mean', SEED_N=35;
+let meanShape, meanN;
+(function loadMean(){ try{ const s=JSON.parse(localStorage.getItem(MEAN_KEY)||'null');
+  if(s&&s.shape&&s.shape.length===20){ meanShape=s.shape; meanN=s.n||SEED_N; return; } }catch(e){}
+  meanShape=CANON.map(p=>p.slice()); meanN=SEED_N; })();
+function deviationOf(ring, part){ part=part||curPart; const ref=idealNormFor(part); if(!ref||!ring) return 0;
+  const s=centerScale(ring), n=Math.min(s.length,ref.length); let e=0;
+  for(let i=0;i<n;i++){ const dx=s[i][0]-ref[i][0], dy=s[i][1]-ref[i][1]; e+=dx*dx+dy*dy; }
+  return clamp(Math.sqrt(e/n)*78, 0, 99.9); }                              // real RMS shape-distance from the part's ideal → %
+function updateMean(ring){ const s=centerScale(ring); const n=meanN;
+  for(let i=0;i<20;i++){ meanShape[i][0]=(meanShape[i][0]*n+s[i][0])/(n+1); meanShape[i][1]=(meanShape[i][1]*n+s[i][1])/(n+1); }
+  meanN=n+1; try{ localStorage.setItem(MEAN_KEY,JSON.stringify({shape:meanShape,n:meanN})); }catch(e){} }
+/* the mean SHAPE re-fitted to a captured ring's own centroid+scale → the "AVERAGE" template overlaid in place */
+function meanTemplateFor(ring, part){ part=part||curPart; const ref=idealNormFor(part); if(!ring||!ref) return null;
+  let cx=0,cy=0; for(const[x,y]of ring){cx+=x;cy+=y;} cx/=ring.length;cy/=ring.length;
+  let s=0; for(const[x,y]of ring){s+=(x-cx)*(x-cx)+(y-cy)*(y-cy);} s=Math.sqrt(s/ring.length)||1;
+  return ref.map(([dx,dy])=>[cx+dx*s, cy+dy*s]); }
+
+/* ---------- REVISION 4 · AESTHETIC STATISTICS shared state (one source of truth) ---------- */
+function percentileFromDev(d){ return clamp(Math.round(99*Math.exp(-d/30)),1,99); }   // devShown≈31 → ~35th; low deviation → high percentile
+let pctShown=34;                                                                       // eased toward percentileFromDev(devShown) each frame
+const easeCubic=t=>1-Math.pow(1-t,3);
+let regionalSamples=(+localStorage.getItem('umwelt.regionalSamples'))||21406;          // ONE population figure: SAMPLE Nº === "N regional samples"
+function commitSample(){ regionalSamples++; try{ localStorage.setItem('umwelt.regionalSamples',regionalSamples);}catch(e){} }
+function ord(n){ n=Math.round(n); const s=['TH','ST','ND','RD'], v=n%100; return n+(s[(v-20)%10]||s[v]||s[0]); }   // 1ST 2ND 3RD 34TH
+function fmt(n){ return Math.round(n).toLocaleString('en-US'); }                       // 21,409
+/* multi-organ queue (Umwelt-local); the next organ opens only after the previous visibly closes out */
+const queue=[ {n:'01',label:'LIPS',status:'ANALYZING'}, {n:'02',label:'NOSE',status:'QUEUED'},
+  {n:'03',label:'BROWS',status:'QUEUED'}, {n:'04',label:'EYES',status:'QUEUED'}, {n:'05',label:'JAWLINE',status:'MODULE PENDING'} ];
+function resetQueue(){ queue[0].status='ANALYZING'; queue[1].status='QUEUED'; }
+let sessionSampleNo=regionalSamples, report=null;                                       // frozen at capture / report
+/* Rev5 · the verdict is a persistent judgment, not a passing readout */
+let lastPct=(()=>{ const v=localStorage.getItem('umwelt.lastPct'); return v==null?null:+v; })();   // the PREVIOUS visitor's rank
+let verdict=null;                                                                        // {cls,pct} — stamped at sentencing, held through every later state
+function classifyDev(d){ return d<10?'NEAR-IDEAL':d<25?'ACCEPTABLE':d<45?'SUBSTANDARD':'CORRECTION URGENT'; }
+
+/* ---------- catalog material (real cutouts) for COMPARE flicker ---------- */
+const lipImgs=[]; const NLIP=35; for(let i=0;i<NLIP;i++){ const im=new Image(); im.src='lips/lip'+i+'.png'; im.onload=()=>lipImgs[i]=im; }
+/* Rev5 · the database lips ARE the ranked population — each gets a fixed fictional sample Nº + percentile (stable all session) */
+const LIP_POP=(()=>{ const h=s=>{ const x=Math.sin(s*127.1+11.7)*43758.5453; return x-Math.floor(x); };
+  return Array.from({length:NLIP},(_,i)=>({ img:i, no:10000+Math.floor(h(i*9.13+2.2)*89000), pct:1+Math.floor(h(i*3.71+5.5)*98) })); })();
+const LIP_RANK=[...LIP_POP].sort((a,b)=>a.pct-b.pct);                                    // ascending percentile → neighbour lookup
+
+/* ---------- THE IDEAL flesh (shape-aligned average of the real cutouts) — for GRADING / IDEAL_ALONE ---------- */
+const NPRO=48, ANAS=160;
+const _ana=document.createElement('canvas'); _ana.width=_ana.height=ANAS; const actx=_ana.getContext('2d',{willReadFrequently:true});
+function lipGeometry(img){ const S=ANAS; actx.clearRect(0,0,S,S);
+  const a=img.naturalWidth/img.naturalHeight; let dw=S,dh=S/a; if(dh>S){dh=S;dw=S*a;}
+  actx.drawImage(img,(S-dw)/2,(S-dh)/2,dw,dh);
+  let dat; try{ dat=actx.getImageData(0,0,S,S).data; }catch(e){ return null; }
+  let cx=0,cy=0,n=0; const TH=60;
+  for(let y=0;y<S;y++)for(let x=0;x<S;x++){ if(dat[(y*S+x)*4+3]>TH){ cx+=x;cy+=y;n++; } }
+  if(n<50) return null; cx/=n; cy/=n;
+  let lx=S,ly=cy,rx=0,ry=cy;
+  for(let y=0;y<S;y++)for(let x=0;x<S;x++){ if(dat[(y*S+x)*4+3]>TH){ if(Math.abs(y-cy)<S*0.18){ if(x<lx){lx=x;ly=y;} if(x>rx){rx=x;ry=y;} } } }
+  const prof=new Float32Array(NPRO); let pm=0;
+  for(let i=0;i<NPRO;i++){ const ang=i/NPRO*6.28318, ca=Math.cos(ang), sa=Math.sin(ang); let rmax=2;
+    for(let r=2;r<S*0.62;r+=1){ const x=Math.round(cx+ca*r), y=Math.round(cy+sa*r); if(x<0||x>=S||y<0||y>=S) break; if(dat[(y*S+x)*4+3]>TH) rmax=r; }
+    prof[i]=rmax; pm+=rmax; }
+  pm/=NPRO; for(let i=0;i<NPRO;i++) prof[i]/=pm;
+  return { prof, comm:[[(lx-(S-dw)/2)/dw,(ly-(S-dh)/2)/dh],[(rx-(S-dw)/2)/dw,(ry-(S-dh)/2)/dh]] }; }
+let idealReady=false, idealRingN=null; const idealCv=document.createElement('canvas'); idealCv.width=560; idealCv.height=380; const ictx=idealCv.getContext('2d',{willReadFrequently:true});
+function computeIdeal(){
+  const imgs=lipImgs.filter(Boolean); const geos=[];
+  for(const im of imgs){ const g=lipGeometry(im); if(g) geos.push({im,g}); }
+  if(!geos.length){ idealReady=true; return; }
+  const W=idealCv.width,H=idealCv.height, d1=[W*0.16,H*0.52], d2=[W*0.84,H*0.52];
+  ictx.clearRect(0,0,W,H); ictx.fillStyle='#000'; ictx.fillRect(0,0,W,H);
+  ictx.globalCompositeOperation='lighter';
+  for(const {im,g} of geos){
+    const s1=[g.comm[0][0]*im.naturalWidth, g.comm[0][1]*im.naturalHeight], s2=[g.comm[1][0]*im.naturalWidth, g.comm[1][1]*im.naturalHeight];
+    const sdx=s2[0]-s1[0], sdy=s2[1]-s1[1], ddx=d2[0]-d1[0], ddy=d2[1]-d1[1];
+    const sl=Math.hypot(sdx,sdy)||1, scl=Math.hypot(ddx,ddy)/sl, rot=Math.atan2(ddy,ddx)-Math.atan2(sdy,sdx);
+    const co=Math.cos(rot)*scl, si=Math.sin(rot)*scl;
+    ictx.save(); ictx.setTransform(co,si,-si,co, d1[0]-(co*s1[0]-si*s1[1]), d1[1]-(si*s1[0]+co*s1[1]));
+    ictx.globalAlpha=1/geos.length; try{ ictx.drawImage(im,0,0); }catch(e){} ictx.restore(); }
+  ictx.globalCompositeOperation='source-over'; ictx.globalAlpha=1; ictx.setTransform(1,0,0,1,0,0);
+  try{ const im=ictx.getImageData(0,0,W,H), p=im.data; for(let i=0;i<p.length;i+=4){ for(let c=0;c<3;c++) p[i+c]=clamp((p[i+c]-118)*1.34+118,0,255); } ictx.putImageData(im,0,0); }catch(e){}
+  idealRingN=ringFromLumi(idealCv); idealReady=true; }
+function ringFromLumi(canvas){ const W=canvas.width,H=canvas.height; let dat; try{ dat=canvas.getContext('2d').getImageData(0,0,W,H).data; }catch(e){ return null; }
+  const TH=40; let cx=0,cy=0,nn=0; for(let y=0;y<H;y++)for(let x=0;x<W;x++){ const i=(y*W+x)*4; if((dat[i]+dat[i+1]+dat[i+2])/3>TH){cx+=x;cy+=y;nn++;} } if(nn<80) return null; cx/=nn;cy/=nn;
+  const pts=[]; for(let i=0;i<NPRO;i++){ const ang=i/NPRO*6.28318, ca=Math.cos(ang), sa=Math.sin(ang); let rmax=2;
+    for(let r=2;r<Math.min(W,H)*0.58;r+=1){ const x=Math.round(cx+ca*r), y=Math.round(cy+sa*r); if(x<0||x>=W||y<0||y>=H)break; const j=(y*W+x)*4; if((dat[j]+dat[j+1]+dat[j+2])/3>TH) rmax=r; }
+    pts.push([(cx+ca*rmax)/W,(cy+sa*rmax)/H]); } return pts; }
+function ensureIdeal(){ if(!idealReady && lipImgs.filter(Boolean).length>=20) computeIdeal(); }
+function drawIdeal(R,alpha,withRing){ if(!idealReady) return; const a=idealCv.width/idealCv.height; let dw=R.w,dh=R.w/a; if(dh>R.h){dh=R.h;dw=R.h*a;} const ox=R.x+(R.w-dw)/2, oy=R.y+(R.h-dh)/2;
+  xc.save(); xc.globalAlpha=alpha==null?1:alpha; xc.drawImage(idealCv,ox,oy,dw,dh); xc.restore();
+  if(withRing && idealRingN) strokeRing(idealRingN.map(([x,y])=>[ox+x*dw,oy+y*dh]), WHITE,1.4,[5,4]); }
+/* the GEOMETRIC ideal (nose/eyes) — the idealised symmetric contour, no reference flesh */
+function drawIdealGeo(R,alpha){ const ref=idealNormFor(curPart); if(!ref) return;
+  let mnx=1e9,mxx=-1e9,mny=1e9,mxy=-1e9; for(const[x,y]of ref){ if(x<mnx)mnx=x;if(x>mxx)mxx=x;if(y<mny)mny=y;if(y>mxy)mxy=y; }
+  const rw=(mxx-mnx)||1, rh=(mxy-mny)||1, s=Math.min(R.w/rw,R.h/rh)*0.82;       // fit the ideal's bbox into the panel, preserving aspect
+  const cx=R.x+R.w/2, cy=R.y+R.h/2, pts=ref.map(([x,y])=>[cx+x*s,cy+y*s]);
+  xc.save(); xc.globalAlpha=alpha==null?1:alpha;
+  xc.fillStyle=CY+'0.05)'; xc.beginPath(); pts.forEach((p,i)=>i?xc.lineTo(p[0],p[1]):xc.moveTo(p[0],p[1])); xc.closePath(); xc.fill();
+  xc.fillStyle=CY+'0.7)'; for(const p of pts) xc.fillRect(p[0]-1,p[1]-1,2,2); xc.restore();
+  strokeRing(pts, WHITE,1.4,[5,4]);
+  ctext('NO REFERENCE FLESH LOADED', cx, cy+R.h*0.42, {size:6,col:CY+'0.5)',align:'center',cap:true}); }
+/* unified: photographic ideal for lips, geometric ghost for nose/eyes */
+function drawPartIdeal(R,alpha,withRing){ if(curPart.flesh && idealReady) drawIdeal(R,alpha,withRing); else drawIdealGeo(R,alpha); }
+
+/* ---------- MediaPipe ---------- */
+let liveLM=null, camOK=false, lastVT=-1, delegateUsed='-', faceCount=0, lastLM=null;
+const LIPS=[61,185,40,39,37,0,267,269,270,409,291,375,321,405,314,17,84,181,91,146];
+/* ---------- selectable body parts · LIPS = photographic ideal, NOSE/EYES = geometric ideal ---------- */
+const EYE_R=[33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246];        // subject's right eye ring (16)
+const NOSE_R=[168,122,188,114,129,98,97,2,326,327,358,343,412,351];                // nose perimeter (~14) — loose, needs visual tuning
+const PART={ LIPS:{key:'LIPS',ring:LIPS,flesh:true,padx:1.7,pady:2.15,idealNorm:null,rows:[['UPPER LIP HEIGHT','upV','mm'],['LOWER LIP VOLUME','area','mm²'],['CORNER ANGLE','cb','°'],['SYMMETRY','symIdx','%'],['VERMILION DEFINITION','H','mm']]},
+  NOSE:{key:'NOSE',ring:NOSE_R,flesh:false,padx:1.55,pady:1.5,idealNorm:null,rows:[['NASAL WIDTH','W','mm'],['NASAL LENGTH','H','mm'],['TIP ANGLE','cb','°'],['SYMMETRY','symIdx','%'],['BRIDGE DEFINITION','perim','mm']]},
+  EYES:{key:'EYES',ring:EYE_R,flesh:false,padx:2.0,pady:2.8,idealNorm:null,rows:[['PALPEBRAL WIDTH','W','mm'],['APERTURE HEIGHT','H','mm'],['CANTHAL TILT','orient','°'],['SYMMETRY','symIdx','%'],['LID DEFINITION','perim','mm']]} };
+const PART_ORDER=[PART.LIPS,PART.NOSE,PART.EYES];
+const SEL_CYC=2.6;                                                                  // seconds each region stays highlighted
+let curPart=PART.LIPS, selStart=0, selHighlight=0, selArmed=false, selDwell=0;   // confirm is armed by a CLOSED mouth, then a sustained open-hold (selDwell) commits
+const forcePart=(()=>{ const m=location.search.match(/part=(\w+)/i); return m?(PART[m[1].toUpperCase()]||null):null; })();  // ?part=nose|eyes for testing
+if(forcePart) curPart=forcePart;
+function mouthOpen(L){ if(!L) return 0; const g=Math.hypot(L[13].x-L[14].x,L[13].y-L[14].y), w=Math.hypot(L[61].x-L[291].x,L[61].y-L[291].y)||1; return g/w; }
+function selectPart(part){ curPart=part; for(const q of queue){ q.status = q.label==='JAWLINE'?'MODULE PENDING' : (q.label===part.key?'ANALYZING':'QUEUED'); } enter(S.ACQUIRE); }
+function ringOf(L,part){ if(!L) return null; const cx=vidCrop.cx,cy=vidCrop.cy,hx=vidCrop.hx,hy=vidCrop.hy;
+  return part.ring.map(k=>{ const uX=1-(L[k].x-(cx-hx))/(2*hx); const v=(L[k].y-(cy-hy))/(2*hy); return [clamp(uX,0,1),clamp(v,0,1)]; }); }
+/* the geometric IDEAL for a part = the perfectly-symmetric form of its shape (mirror-averaged) — an external target no real face occupies */
+function symmetrize(P){ const out=P.map(p=>p.slice());
+  for(let i=0;i<P.length;i++){ let best=0,bd=1e9; for(let j=0;j<P.length;j++){ const d=Math.hypot(P[j][0]+P[i][0],P[j][1]-P[i][1]); if(d<bd){bd=d;best=j;} }
+    out[i]=[(P[i][0]-P[best][0])/2,(P[i][1]+P[best][1])/2]; } return out; }
+function idealNormFor(part){ return part===PART.LIPS ? meanShape : part.idealNorm; }   // lips: designed mean · others: symmetric form
+const vidCrop={cx:0.5,cy:0.62,hx:0.14,hy:0.10}; let presence=0, lastSeen=0;
+const COUNT_KEY='umwelt.vision.count'; let count=parseInt(localStorage.getItem(COUNT_KEY)||'0',10); if(isNaN(count))count=0;
+function log(...a){ console.log('[umwelt]',...a); }
+async function makeLandmarker(d){ const fs=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  return FaceLandmarker.createFromOptions(fs,{baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",delegate:d},runningMode:"VIDEO",numFaces:1}); }
+let usingDemo=false;
+async function useDemoFace(){                                   // still stand-in face → drives the flow when there's no camera
+  const fimg=new Image(); fimg.src='faces/face1.jpg'; await fimg.decode();
+  const dc=document.createElement('canvas'); dc.width=dc.height=640; const dx=dc.getContext('2d');
+  const cs=Math.max(640/fimg.naturalWidth,640/fimg.naturalHeight);
+  (function dr(){ dx.fillStyle='#000'; dx.fillRect(0,0,640,640); dx.drawImage(fimg,(640-fimg.naturalWidth*cs)/2,(640-fimg.naturalHeight*cs)/2,fimg.naturalWidth*cs,fimg.naturalHeight*cs); requestAnimationFrame(dr); })();
+  vid.srcObject=dc.captureStream(30); await vid.play(); camOK=true; usingDemo=true;
+}
+async function goLive(){
+  if(location.search.includes('nocam')){ camOK=false; return; }
+  try{ liveLM=await makeLandmarker("GPU"); delegateUsed='GPU'; }catch(e){ try{ liveLM=await makeLandmarker("CPU"); delegateUsed='CPU'; }catch(e2){ liveLM=null; delegateUsed='FAIL'; log('LM FAIL',e2?.message); } }
+  if(location.search.includes('demoface')){ try{ await useDemoFace(); }catch(e){ camOK=false; log('demo FAIL',e?.message); } return; }
+  try{                                                          // camera is the default
+    const st=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:1920},height:{ideal:1920}},audio:false});   // higher res → more mouth pixels, less upscale blur
+    vid.srcObject=st; await vid.play(); camOK=true;
+  }catch(e){ log('cam unavailable → demo fallback', e?.message);   // denied/busy/none → never sit blank
+    try{ await useDemoFace(); }catch(e2){ camOK=false; log('demo FAIL',e2?.message); } }
+}
+function readMouth(nowMs){
+  if(!liveLM||!camOK||vid.readyState<2) return; if(vid.currentTime===lastVT) return; lastVT=vid.currentTime;
+  let res; try{ res=liveLM.detectForVideo(vid,nowMs); }catch(e){ return; }
+  faceCount=(res&&res.faceLandmarks)?res.faceLandmarks.length:0;
+  if(faceCount){ const L=res.faceLandmarks[0]; lastLM=L; let mnx=1,mxx=0,mny=1,mxy=0;
+    for(const k of curPart.ring){ const x=L[k].x,y=L[k].y; if(x<mnx)mnx=x; if(x>mxx)mxx=x; if(y<mny)mny=y; if(y>mxy)mxy=y; }   // crop to the SELECTED part
+    const cx=(mnx+mxx)/2, cy=(mny+mxy)/2, hx=(mxx-mnx)/2*curPart.padx, hy=(mxy-mny)/2*curPart.pady;
+    if(!frozen){ vidCrop.cx=lerp(vidCrop.cx,cx,0.4); vidCrop.cy=lerp(vidCrop.cy,cy,0.4); vidCrop.hx=lerp(vidCrop.hx,Math.max(0.04,hx),0.3); vidCrop.hy=lerp(vidCrop.hy,Math.max(0.03,hy),0.3); liveRing=ringFromLM(L); }
+    let fnx=1,fxx=0,fny=1,fxy=0;                                            // full-face bbox (all 478) for the mesh phase
+    for(let i=0;i<L.length;i++){ const x=L[i].x,y=L[i].y; if(x<fnx)fnx=x; if(x>fxx)fxx=x; if(y<fny)fny=y; if(y>fxy)fxy=y; }
+    let mlx=0; for(const k of MIDLINE) mlx+=L[k].x; mlx/=MIDLINE.length;    // horizontal crop = the face's true MIDLINE (forehead→nose→chin), not the bbox centre → a turned/asymmetric face still sits on the frame axis
+    const fcx=mlx, fcy=(fny+fxy)/2, fhx=(fxx-fnx)/2*1.18, fhy=(fxy-fny)/2*1.18;
+    faceBox.cx=lerp(faceBox.cx,fcx,0.4); faceBox.cy=lerp(faceBox.cy,fcy,0.4); faceBox.hx=lerp(faceBox.hx,Math.max(0.05,fhx),0.3); faceBox.hy=lerp(faceBox.hy,Math.max(0.05,fhy),0.3);
+    if(!faceEdges && L.length>=468) buildFaceMesh(L);                        // cache mesh topology once (stable)
+    lastSeen=performance.now();
+  }
+}
+goLive();
+
+/* ===========================  FACIAL-RECOGNITION MESH (Consent-style)  ===========================
+   One-time Bowyer–Watson Delaunay over the 478 landmarks → cached edge topology (≤0.12 weave);
+   live vertex positions each frame. Per-vertex seed for inspection-order ink-on. */
+const faceBox={cx:0.5,cy:0.5,hx:0.18,hy:0.22};                  // smoothed full-face bbox (set in readMouth)
+const ACCENT=[1,4,33,133,362,263,13,14,152,234,454];            // the 11 coroner ID points (eyes/nose/mouth/chin/tragus)
+const MIDLINE=[10,151,168,6,197,195,5,4,1,2,164,0,17,18,200,152]; // sagittal centreline: forehead→nasion→nose→lips→chin (used to horizontally centre the crop)
+let faceEdges=null, faceSeed=null, faceRegion=null;
+function triangulate(pts){                                       // Bowyer–Watson; pts=[[x,y],...] in 0..1
+  const n=pts.length; if(n<3) return [];
+  let minx=1e9,miny=1e9,maxx=-1e9,maxy=-1e9;
+  for(const[x,y]of pts){ if(x<minx)minx=x; if(y<miny)miny=y; if(x>maxx)maxx=x; if(y>maxy)maxy=y; }
+  const dm=Math.max(maxx-minx,maxy-miny)||1, mx=(minx+maxx)/2, my=(miny+maxy)/2;
+  const P=pts.map(p=>[p[0],p[1]]); const s=n;
+  P.push([mx-20*dm,my-dm],[mx,my+20*dm],[mx+20*dm,my-dm]);
+  const circ=(a,b,c)=>{ const ax=P[a][0],ay=P[a][1],bx=P[b][0],by=P[b][1],cx=P[c][0],cy=P[c][1];
+    const ab=ax*ax+ay*ay,cd=bx*bx+by*by, ef=cx*cx+cy*cy;
+    const D=2*(ax*(by-cy)+bx*(cy-ay)+cx*(ay-by)); if(Math.abs(D)<1e-12) return null;
+    const ux=(ab*(by-cy)+cd*(cy-ay)+ef*(ay-by))/D, uy=(ab*(cx-bx)+cd*(ax-cx)+ef*(bx-ax))/D;
+    return {x:ux,y:uy,r:(ux-ax)*(ux-ax)+(uy-ay)*(uy-ay)}; };
+  let tris=[[s,s+1,s+2]];
+  for(let i=0;i<n;i++){ const bad=[];
+    for(const t of tris){ const c=circ(t[0],t[1],t[2]); if(c&&((P[i][0]-c.x)**2+(P[i][1]-c.y)**2)<=c.r) bad.push(t); }
+    const edges=[];
+    for(const t of bad){ const es=[[t[0],t[1]],[t[1],t[2]],[t[2],t[0]]];
+      for(const e of es){ let shared=false; for(const t2 of bad){ if(t2===t)continue; if(t2.includes(e[0])&&t2.includes(e[1])){shared=true;break;} } if(!shared) edges.push(e); } }
+    tris=tris.filter(t=>!bad.includes(t)); for(const e of edges) tris.push([e[0],e[1],i]); }
+  return tris.filter(t=>t[0]<n&&t[1]<n&&t[2]<n);
+}
+function buildFaceMesh(L){
+  const pts=[]; for(let i=0;i<468;i++) pts.push([L[i].x,L[i].y]);
+  const tris=triangulate(pts); const set=new Set(); const MAXLEN=0.12;
+  const add=(a,b)=>{ if(a>b){const t=a;a=b;b=t;} if(Math.hypot(pts[a][0]-pts[b][0],pts[a][1]-pts[b][1])<=MAXLEN) set.add(a*1000+b); };
+  for(const t of tris){ add(t[0],t[1]); add(t[1],t[2]); add(t[2],t[0]); }
+  faceEdges=[...set].map(k=>[Math.floor(k/1000),k%1000]);
+  faceSeed=new Float32Array(468); faceRegion=new Int8Array(468);
+  let fnx=1,fxx=0,fny=1,fxy=0;                                              // accurate face bbox FROM L (faceBox smoothing lags on frame 1 → mis-banded regions)
+  for(let i=0;i<468;i++){ const x=L[i].x,y=L[i].y; if(x<fnx)fnx=x; if(x>fxx)fxx=x; if(y<fny)fny=y; if(y>fxy)fxy=y; }
+  const b={cx:(fnx+fxx)/2, cy:(fny+fxy)/2, hx:(fxx-fnx)/2*1.18, hy:(fxy-fny)/2*1.18};
+  for(let i=0;i<468;i++){ faceSeed[i]=rnd(i*2.17);
+    const u=(L[i].x-(b.cx-b.hx))/(2*b.hx), v=(L[i].y-(b.cy-b.hy))/(2*b.hy);  // region for discard order
+    faceRegion[i]=classifyRegion(u,v); }
+  for(let i=0;i<468;i++) if(faceRegion[i]===10) faceRegion[i]=9;            // clear geometric mouth guesses
+  for(const k of LIPS) if(k<468) faceRegion[k]=10;                          // ARTICULATORY = the ACTUAL lip landmarks (never the eyes)
+}
+/* 11 clinical body-part regions; ARTICULATORY (mouth, 10) is RETAINED — discard runs by .prio, mouth last */
+const BPARTS=[
+  {label:'OCULAR·L',prio:0},{label:'OCULAR·R',prio:0},{label:'SUPRAORBITAL·L',prio:1},{label:'SUPRAORBITAL·R',prio:1},
+  {label:'NASAL',prio:2},{label:'AURICULAR·L',prio:3},{label:'AURICULAR·R',prio:3},{label:'BUCCAL·L',prio:4},{label:'BUCCAL·R',prio:4},
+  {label:'MANDIBULAR',prio:5},{label:'ARTICULATORY',prio:99} ];
+function classifyRegion(u,v){ const c=u-0.5;
+  if(v>=0.60 && v<=0.86 && Math.abs(c)<0.26) return 10;          // ARTICULATORY (mouth) — retained
+  if(Math.abs(c)>0.40) return c<0?5:6;                           // auricular L/R (ears)
+  if(v<0.30) return c<0?2:3;                                     // supraorbital L/R (brows)
+  if(v<0.45){ if(Math.abs(c)<0.10) return 4; return c<0?0:1; }   // ocular L/R (eyes) · nose bridge
+  if(v<0.60){ if(Math.abs(c)<0.14) return 4; return c<0?7:8; }   // nasal centre · buccal L/R (cheeks)
+  return 9;                                                      // mandibular (jaw/chin)
+}
+/* live landmark k → mirrored screen position inside the specimen plate */
+function faceVtx(L,k,plate){ const b=faceBox; const uX=1-((L[k].x-(b.cx-b.hx))/(2*b.hx)); const v=(L[k].y-(b.cy-b.hy))/(2*b.hy);
+  return [plate.x+clamp(uX,-0.3,1.3)*plate.w, plate.y+clamp(v,-0.3,1.3)*plate.h]; }
+function facePlate(){ const w=sizePx*0.64, h=w*1.18, x=(sizePx-w)/2, y=sizePx*0.15; return {x,y,w,h}; }
+
+/* ===========================  REAL MOUTH-SWAP (optional COMPARE material, isolated :8001) =========================== */
+const SWAP = location.search.includes('swap');                 // OFF by default for the combined flow (no ~28s COMPARE stall); add ?swap to enable the real flux graft
+const SWAP_BASE = 'http://localhost:8001/api/v1';
+let DONOR_IDS=[];                                              // FIXED distinct donor pool (swap/donors.json) — viewer uploads can NEVER pollute it
+fetch('swap/donors.json',{cache:'no-store'}).then(r=>r.json()).then(a=>{ if(Array.isArray(a)) DONOR_IDS=a; console.log('[umwelt] donors',DONOR_IDS.length); }).catch(()=>{});
+let swapMouths=[], swapState='idle', swapDestBbox=null;
+const fullCv=document.createElement('canvas'), fctx2=fullCv.getContext('2d');
+const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
+const jget=async(uu)=>{ const r=await fetch(SWAP_BASE+uu); if(!r.ok) throw new Error('GET '+r.status); return r.json(); };
+const jpost=async(uu,b)=>{ const r=await fetch(SWAP_BASE+uu,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}); if(!r.ok) throw new Error('POST '+r.status); return r.json(); };
+const blobToImg=(b)=>new Promise((res,rej)=>{ const im=new Image(); im.onload=()=>res(im); im.onerror=rej; im.src=URL.createObjectURL(b); });
+async function kickoffSwaps(){
+  if(!SWAP || swapState!=='idle' || !camOK || vid.readyState<2 || !vid.videoWidth) return;
+  swapState='running'; swapMouths=[];
+  try{
+    fullCv.width=vid.videoWidth; fullCv.height=vid.videoHeight; fctx2.drawImage(vid,0,0);
+    const blob=await new Promise(res=>fullCv.toBlob(res,'image/jpeg',0.92));
+    const fd=new FormData(); fd.append('image',blob,'viewer.jpg'); fd.append('rotation','center'); fd.append('kind','portrait');
+    const uj=await (await fetch(SWAP_BASE+'/upload',{method:'POST',body:fd})).json();
+    let dest=uj.existing_image_id;
+    if(!(dest && uj.existing_has_segmentations)){ const dp=await jpost('/session/'+uj.session_id+'/detect-pose',{}); dest=dp.image_id; }
+    if(!dest) throw new Error('no dest');
+    let mouth=null;
+    for(let i=0;i<40 && swapState==='running';i++){ const bp=await jget('/images/'+dest+'/body-parts');
+      const m=(bp.body_parts||[]).find(p=>p.body_part_id==='mouth'); if(m&&m.bbox_width){ mouth=m; break; } await sleep(400); }
+    if(!mouth) throw new Error('no mouth'); swapDestBbox=mouth;
+    const donors=DONOR_IDS.filter(id=>id&&id!==dest).slice(0,4);   // fixed distinct donors (4 → fewer flux calls = less $ / faster first result)
+    if(!donors.length) throw new Error('no donors (swap/donors.json empty?)');
+    const bi=await jpost('/images/'+dest+'/bulk-swap',{items:donors.map(s=>({part_id:'mouth',source_image_id:s,strength:0.85})),base_swap_ids:[]});
+    const ids=(bi.results||[]).map(r=>r.swap_id).filter(Boolean);
+    await Promise.allSettled(ids.map(async(sid)=>{
+      for(let i=0;i<80 && swapState==='running';i++){ const s=await jget('/swaps/'+sid+'/status');
+        if(s.status==='completed'){ const m=await fetchCropMouth(sid); if(m) swapMouths.push(m); return; }
+        if(s.status==='failed') return; await sleep(i?150:60); }
+    }));
+    swapState = swapMouths.length ? 'done':'fail';
+  }catch(e){ console.warn('[umwelt] swap',e?.message||e); swapState='fail'; }
+}
+async function fetchCropMouth(sid){
+  try{ const im=await blobToImg(await (await fetch(SWAP_BASE+'/swaps/'+sid+'/composite')).blob());
+    const b=swapDestBbox; const px=b.bbox_width*0.40, py=b.bbox_height*0.75;
+    const sx=Math.max(0,b.bbox_x1-px), sy=Math.max(0,b.bbox_y1-py);
+    const sw=Math.min(im.width-sx,b.bbox_width+2*px), sh=Math.min(im.height-sy,b.bbox_height+2*py);
+    const c=document.createElement('canvas'); c.width=Math.max(2,Math.round(sw)); c.height=Math.max(2,Math.round(sh));
+    c.getContext('2d').drawImage(im,sx,sy,sw,sh,0,0,c.width,c.height); return {canvas:c, aspect:c.width/c.height};
+  }catch(e){ return null; }
+}
+
+/* ===========================  STATE MACHINE  =========================== */
+const S={STANDBY:0,FACE:1,DISFACE:2,ACQUIRE:3,CAPTURE:4,COMPARE:5,MEASURE:6,STRESS:7,DISASSEMBLE:8,DELTA:9,ASSEMBLE:10,ABSORB:11,ARCHIVE:12,RETURN:13,GRADING:14,IDEAL_ALONE:15,ABSENCE:16,EXCHANGE:17,NOSE:18,REPORT:19,SELECT:20};
+const NAME=Object.keys(S);
+const MODE=['STANDBY','RECOGNISE','PURGE','ACQUIRE','CAPTURE','COMPARE','MEASURE','STRESS','SEGMENT','DELTA','NORMALIZE','HELD','ARCHIVE','STANDBY','GRADE','IDEAL','ABSENCE','EXCHANGE','NASAL','REPORT','SELECT'];
+const DUR={ [S.FACE]:4.6,[S.DISFACE]:5.4,[S.ACQUIRE]:5.0,[S.CAPTURE]:2.0,[S.COMPARE]:6.0,[S.MEASURE]:7.0,[S.STRESS]:4.5,[S.DISASSEMBLE]:5.5,[S.DELTA]:4.0,[S.ASSEMBLE]:8.0,[S.ABSORB]:3.0,[S.ARCHIVE]:6.0,[S.RETURN]:1.6,[S.GRADING]:6.5,[S.IDEAL_ALONE]:4.5,[S.ABSENCE]:6.0,[S.EXCHANGE]:5.0,[S.NOSE]:7.0,[S.REPORT]:40.0,[S.SELECT]:16.0 };
+DUR[S.GRADING]=12.0;                                                                       // Rev5: parade (5s) → nearest-rank (3.4s) → freeze (1.2s) → verdict stamp (2.4s)
+const MEAT_OFF=new Set([S.STANDBY,S.FACE,S.DISFACE,S.DISASSEMBLE,S.ARCHIVE,S.RETURN,S.IDEAL_ALONE,S.ABSENCE,S.NOSE,S.REPORT,S.SELECT,S.GRADING]);   // grid only (no GL meat); GRADING is the ranked-population beat on black
+let state=S.STANDBY, st=0, frozen=false, capAmt=0, inflate=0, scanY=-1, chill=0, stretch=0, wetAmt=0, disfaceWaited=0, compareWaited=0;
+let centerX=0.5, scaleX=1;                                       // GRADING: slide the live mouth into the left half
+let devPct=31.6, devShown=31.6, normPct=0, resolvePct=0, modeSwapAt=-9, frameCount=0;
+function enter(ns){ state=ns; st=0; modeSwapAt=T;
+  if(ns===S.SELECT){ selStart=T; selHighlight=0; selArmed=false; selDwell=0; }
+  if(ns===S.CAPTURE){ frozen=true; snapshotCapture(); devShown=devPct;
+    commitSample(); sessionSampleNo=regionalSamples; const qa=queue.find(q=>q.status==='ANALYZING'); if(qa) qa.status='FILED'; }   // the selected organ closes out at the freeze
+  if(ns===S.EXCHANGE){ frozen=false; }                                            // LIVE coaching window: the mouth responds (seduction loop / truth test)
+  if(ns===S.STRESS){ frozen=true; if(lastLM){ const r=ringFromLM(lastLM); if(r){ capLip=r; devPct=deviationOf(r); } } }  // re-freeze the settled pose as the specimen
+  if(ns===S.NOSE){ queue[1].status='SAMPLED — PENDING COMPARISON'; }              // organ 02 opens (live face reads vid directly; frozen stays)
+  if(ns===S.REPORT){ report=buildReport(); lastPct=report.pct; try{localStorage.setItem('umwelt.lastPct',report.pct);}catch(e){} }   // this session becomes the next visitor's "previous"
+  if(ns===S.FACE && SWAP){ kickoffSwaps(); }                    // fire the flux swap at recognition → ~40s to bake, revealed in COMPARE
+  if(ns===S.COMPARE){ compareWaited=0; }
+  if(ns===S.STANDBY){ frozen=false; chill=0; stretch=0; capLip=null; report=null; verdict=null; resetQueue(); if(SWAP){ swapState='idle'; swapMouths=[]; } }
+}
+function tickState(dt, now){
+  st+=dt; frameCount++;
+  if(DEBUG && window.__holdState===state && window.__holdK!=null && DUR[state]) st=window.__holdK*DUR[state];  // debug: pin progress
+  const held = DEBUG && window.__holdState===state;
+  const seen=(now-lastSeen)<250; presence=lerp(presence, seen?1:0, 1-Math.exp(-(seen?5:1.5)*dt));
+  // FACE LOST anywhere → abort to the beginning (STANDBY then waits for a face). NOSE/REPORT run on their
+  // own timers so the secondary pass + the payoff report are never interrupted.
+  if(!held && state!==S.STANDBY && state!==S.NOSE && state!==S.REPORT && presence<0.25 && st>0.5){ enter(S.STANDBY); return; }
+  let tCap=capAmt, tInfl=inflate, tScan=-1, tChill=chill, tStr=0, tCx=0.5, tScl=1, k=DUR[state]?clamp(st/DUR[state],0,1):0;
+  switch(state){
+    case S.STANDBY: tCap=lerp(capAmt,0,1-Math.exp(-4*dt)); tInfl=0; tChill=0;
+      if(!held && presence>0.6 && st>1.6 && faceEdges) enter(S.FACE); break;
+    case S.FACE: tCap=0; tChill=0;                                              // recognise: mesh inks on, holds live = me
+      if(!held){ if(presence<0.25) enter(S.STANDBY); else if(st>=DUR[state]) enter(S.SELECT); } break;
+    case S.SELECT: tCap=0; tChill=0;                                            // deliberate select-then-confirm — no arcade timer
+      if(!held){ if(presence<0.25) enter(S.STANDBY);
+        else if(forcePart){ selectPart(forcePart); }
+        else { const op=mouthOpen(lastLM);
+          if(op<0.12) selArmed=true;                                                       // a CLOSED mouth arms confirm → a resting-open/demo face can't skip the choice
+          if(selArmed && op>0.30) selDwell+=dt; else selDwell=Math.max(0, selDwell-dt*2.2); // then a deliberate open-HOLD commits (decays if released)
+          if(selArmed && selDwell>=0.85 && st>0.8) selectPart(PART_ORDER[selHighlight]);
+          else if(st>=DUR[state]) selectPart(PART_ORDER[selHighlight]); } } break;          // 16s safety fallback → the highlighted (default lips)
+    case S.DISFACE: tCap=0; tChill=0;                                           // strip the face to the mouth, then converge
+      if(!held && st>=DUR[state]) enter(S.ACQUIRE); break;
+    case S.ACQUIRE: tCap=0; tInfl=0; tScan=Math.floor(k*24)/24; tChill=lerp(0,0.30,k);
+      if(!held){ if(presence<0.25) enter(S.STANDBY); else if(st>=DUR[state]) enter(S.CAPTURE); } break;
+    case S.CAPTURE: tCap=lerp(capAmt,1,1-Math.exp(-3.5*dt)); tInfl=0; tChill=0.30; if(!held && st>=DUR[state]) enter(S.COMPARE); break;
+    case S.COMPARE: tCap=1; tInfl=0; tChill=0.30;                               // wait for the real flux swap to bake, then hold a beat on the seamless result
+      if(!held && SWAP && !swapMouths.length && swapState!=='fail' && compareWaited<26.0){ st=Math.min(st,DUR[state]*0.45); compareWaited+=dt; }
+      resolvePct = swapMouths.length ? 100 : (SWAP ? Math.min(97, 8+compareWaited/26*89) : Math.round(clamp(k/0.92,0,1)*100));
+      if(!held && st>=DUR[state]) enter(S.MEASURE); break;
+    case S.MEASURE: tCap=1; tInfl=0; tChill=0.30; if(!held && st>=DUR[state]) enter(S.EXCHANGE); break;
+    case S.EXCHANGE: tCap=0.35; tInfl=0; tChill=0.20; ensureIdeal();            // LIVE: warmer flesh; deviation tracks the live mouth
+      if(liveRing) devPct=deviationOf(liveRing);
+      if(!held && st>=DUR[state]) enter(S.GRADING); break;
+    case S.GRADING: tCap=0.5; tInfl=0; tChill=0.24; ensureIdeal();              // ranked-population beat → sentencing
+      if(k<0.70 && liveRing) devPct=deviationOf(liveRing);                      // stop tracking the live mouth the moment sentencing begins
+      if(k>=0.80 && !verdict) verdict={cls:classifyDev(devShown), pct:Math.round(pctShown)};   // the stamp lands → judgment persists
+      if(!held && st>=DUR[state]) enter(S.STRESS); break;
+    case S.STRESS: tCap=1; tInfl=0; tChill=0.34;                                // caliper ratchets the width out, then recoils
+      tStr=(k<0.80)?(Math.floor(k/0.80*7)/7):lerp(1,0,smoothstep(0.80,1.0,k));
+      if(!held && st>=DUR[state]) enter(S.DISASSEMBLE); break;
+    case S.DISASSEMBLE: tCap=1; tInfl=0; tChill=0.32; if(!held && st>=DUR[state]) enter(S.DELTA); break;
+    case S.DELTA: tCap=1; tInfl=0; tChill=0.32; if(!held && st>=DUR[state]) enter(S.IDEAL_ALONE); break;
+    case S.NOSE: tCap=1; tInfl=0; tChill=0.30;                                  // coda: the mouth is fully done → the machine helps itself to the NEXT organ, then reports
+      if(!held && st>=DUR[state]) enter(S.REPORT); break;
+    case S.IDEAL_ALONE: tCap=1; tInfl=0; tChill=0.34; ensureIdeal();
+      if(!held && st>=DUR[state]) enter(S.ASSEMBLE); break;
+    case S.ASSEMBLE: tCap=1; tInfl=clamp(k,0,1); tChill=lerp(0.32,0.42,k); normPct=k*100; devShown=devPct*(1-k);
+      if(!held && st>=DUR[state]) enter(S.ABSORB); break;
+    case S.ABSORB: tCap=1; tInfl=1.0; tChill=0.42; devShown=0; normPct=100; if(!held && st>=DUR[state]) enter(S.ARCHIVE); break;
+    case S.ARCHIVE: tCap=1; tInfl=1.0; tChill=0.42; if(!held && st>=DUR[state]) enter(S.ABSENCE); break;
+    case S.ABSENCE: tCap=1; tInfl=lerp(1.0,0.2,k); tChill=0.40;
+      devShown=lerp(0, devPct, smoothstep(0,0.6,k));
+      if(!held && st>=DUR[state]) enter(S.REPORT); break;
+    case S.REPORT: tCap=1; tInfl=0; tChill=0.40;                                // the certificate — total legibility, holds ~20s
+      if(!held && st>=DUR[state]) enter(S.RETURN); break;
+    case S.RETURN: tCap=lerp(capAmt,0,1-Math.exp(-3*dt)); tInfl=0; tChill=lerp(chill,0,1-Math.exp(-2.5*dt)); if(!held && st>=DUR[state]) enter(S.STANDBY); break;
+  }
+  capAmt=tCap; inflate=tInfl; scanY=tScan; chill=tChill; stretch=tStr; centerX=tCx; scaleX=tScl;
+  // CLINICAL MIDDLE STAYS SHARP for legibility (the examination must read clearly); the deliberate wet-in happens only at the END (the specimen relaxes)
+  let tWet=0.05;                                                            // near-sharp baseline (warm colour is separate, always on)
+  if(state<=S.CAPTURE) tWet=0;                                             // crisp cutout through capture
+  else if(state===S.ABSORB) tWet=lerp(0.05,0.62,k);                        // wet-in at the end, slow + deliberate
+  else if(state===S.ARCHIVE) tWet=0.62;
+  else if(state===S.RETURN) tWet=lerp(wetAmt,0,1-Math.exp(-3*dt));
+  wetAmt=tWet;
+  const gfreeze=(state===S.GRADING && k>=0.70);                                  // sentencing freeze — the numbers stop dead before the verdict
+  if(state!==S.ASSEMBLE && state!==S.ABSORB && state!==S.ABSENCE && !gfreeze) devShown=lerp(devShown, devPct, 1-Math.exp(-6*dt));
+  if(!gfreeze) pctShown=lerp(pctShown, percentileFromDev(devShown), 1-Math.exp(-6*dt));       // settles ~300ms, never jitters
+}
+
+/* ===========================  RENDER  =========================== */
+let prevT=performance.now()*0.001, startT=prevT, T=0;
+function frame(){
+  const now=performance.now(), t=now*0.001; let dt=t-prevT; prevT=t; if(dt>0.05)dt=0.05; T=t-startT;
+  readMouth(now); updateCrop(); tickState(dt, now);
+
+  gl.clearColor(0.0,0.0,0.0,1.0); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.uniform1f(u.time,T); gl.uniform1f(u.hasCrop,hasCrop);                    // GL always draws — the grid ground is continuous
+  gl.uniform1f(u.aspect,frozen?stillAspect:cropAspect); gl.uniform1f(u.capture,capAmt); gl.uniform1f(u.inflate,inflate);
+  gl.uniform1f(u.scanY,scanY); gl.uniform1f(u.chill,chill); gl.uniform1f(u.stretch,stretch); gl.uniform1f(u.wet,wetAmt);
+  gl.uniform1f(u.face, MEAT_OFF.has(state)?1:0);
+  gl.uniform1f(u.centerX, centerX); gl.uniform1f(u.scale, scaleX);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+
+  drawBokeh();                                                                  // dark receding lip field behind the hero (#bg z1)
+  xc.clearRect(0,0,sizePx,sizePx);
+  const k=DUR[state]?clamp(st/DUR[state],0,1):0;
+  if(state===S.STANDBY) drawStandby();
+  else if(state===S.FACE) drawFace(k);
+  else if(state===S.DISFACE) drawDisface(k);
+  else if(state===S.ACQUIRE) drawAcquire(k);
+  else if(state===S.COMPARE) drawCompare(k);
+  else if(state===S.MEASURE) drawMeasure(k);
+  else if(state===S.STRESS) drawStress(k);
+  else if(state===S.DISASSEMBLE) drawDisassemble(k);
+  else if(state===S.DELTA) drawDelta(k);
+  else if(state===S.ASSEMBLE) drawAssemble(k);
+  else if(state===S.ARCHIVE) drawArchive(k);
+  else if(state===S.RETURN) drawArchive(1);
+  else if(state===S.EXCHANGE) drawExchange(k);
+  else if(state===S.GRADING) drawGrading(k);
+  else if(state===S.IDEAL_ALONE) drawIdealAlone(k);
+  else if(state===S.ABSENCE) drawAbsence(k);
+  else if(state===S.NOSE) drawNose(k);
+  else if(state===S.SELECT) drawSelect(k);
+  else if(state===S.REPORT) drawReport(k);
+  if(state!==S.REPORT){ drawChrome(); drawStatHeader(); drawQueue();       // report is a full-bleed certificate — no chrome over it
+    if(MEASURE_STATES.has(state)) drawDistribution();
+    if(verdict && state!==S.GRADING && state!==S.STANDBY) drawCornerVerdict();   // the judgment does not go away
+    const sentencing=(state===S.GRADING && st>=(DUR[S.GRADING]||12)*0.70);       // freeze/verdict = silence
+    if(state!==S.SELECT && !sentencing) drawCommentary(); }                      // SELECT has its own instructions — no commentary collision
+  drawHud();
+  requestAnimationFrame(frame);
+}
+
+/* ---------- cold-type helpers (no fade — scramble/step/count) ---------- */
+const rnd=(s)=>{ const x=Math.sin(s*127.1)*43758.5453; return x-Math.floor(x); };
+const GP='ABCDEF0123456789/#░▒▓';
+function scr(text){ const step=Math.floor(T*30); let o=''; for(let i=0;i<text.length;i++){ const c=text[i]; o+= (c===' '?' ':GP[Math.floor(rnd(step+i*3.1)*GP.length)]); } return o; }
+function ctext(s, x, y, o){ o=o||{}; const size=o.size||9, col=o.col||CYAN, w=o.w||400, align=o.align||'left';
+  xc.save(); xc.font=(w===700?'700 ':'')+size+"px 'PP Fraktion Mono',monospace"; xc.textAlign=align; xc.textBaseline='alphabetic';
+  if(o.track!=null) xc.letterSpacing=o.track+'px';                              // engraved-instrument tracking on labels
+  if(o.cap){ xc.fillStyle='#000'; for(const off of [[-1,0],[1,0],[0,-1],[0,1]]) xc.fillText(s,x+off[0],y+off[1]); }
+  xc.fillStyle=col; xc.fillText(s,x,y); xc.restore();
+}
+function pad(n,w){ return String(Math.max(0,Math.round(n))).padStart(w,'0'); }
+const SHA=(()=>{ let h=''; for(let i=0;i<6;i++) h+=GP[Math.floor(rnd(count*7+i)*16)]; return h; })();
+function specId(){ return 'SPEC-MTH-'+pad(count,4); }
+
+/* ---------- the still cold cage: inset rule, four fixed corners, deviation axis, status ribbon ---------- */
+function drawChrome(){                                                                     // pristine: no scramble, no corner cage — the header/commentary carry the state
+  const ins=INSET(), R={x:ins,y:ins,w:sizePx-2*ins,h:sizePx-2*ins};
+  const ribbon=RIBBON(); if(ribbon) ctext(ribbon, ins, R.y+R.h-6, {size:8,col:CY+'0.5)',cap:true,track:1});   // MICRO faint status
+}
+function drawAxis(R){
+  const ax=R.x+R.w-2, y0=R.y+6, y1=R.y+R.h-18, mid=(y0+y1)/2;
+  xc.save(); xc.strokeStyle=CY+'0.5)'; xc.lineWidth=1;
+  xc.beginPath(); xc.moveTo(ax,y0); xc.lineTo(ax,y1); xc.stroke();
+  for(let i=0;i<=10;i++){ const y=lerp(y0,y1,i/10), heavy=(i===5); xc.beginPath(); xc.moveTo(ax-(heavy?7:4),y); xc.lineTo(ax,y); xc.stroke(); }
+  ctext('AVG', ax-10, mid+3, {size:7,col:CY+'0.8)',align:'right'});
+  const yc=lerp(mid, y0, clamp(devShown/100,0,1));                            // caret height = deviation
+  xc.strokeStyle=WHITE; xc.lineWidth=1; xc.beginPath(); xc.moveTo(ax-1,mid); xc.lineTo(ax-1,yc); xc.stroke();   // 1px hairline = the stat
+  ctext('▸', ax+2, yc+3, {size:9,col:WHITE});
+  xc.restore();
+}
+function RIBBON(){
+  switch(state){
+    case S.STANDBY: return presence>0.5?'SUBJECT DETECTED':'AWAITING SUBJECT';
+    case S.FACE:{ const v=Math.min(478,Math.floor(st/DUR[state]*1300)); return st>DUR[state]*0.32?'FACE GEOMETRY · LOCK · 478 POINTS':('LOCATING FACE · '+pad(v,3)+'/478 POINTS'); }
+    case S.SELECT: return '';                                                  // no duplicate — the on-screen instruction owns this
+    case S.DISFACE:{ if(st<DUR[state]*0.46) return 'PARSING FACE · 11 REGIONS'; if(st>DUR[state]*0.86) return 'RETAINED — 01 LIPS · OTHER PARTS QUEUED'; return 'ISOLATING ARTICULATORY REGION'; }
+    case S.ACQUIRE: return 'ACQUIRING LIP SAMPLE · ALIGN AND HOLD';
+    case S.CAPTURE: return 'SAMPLE Nº '+fmt(sessionSampleNo)+' · RECORDED';
+    case S.COMPARE: return 'RETRIEVING THE IDEAL LIPS · 2026 EDITION';
+    case S.MEASURE: return 'MEASURING · DEVIATION FROM IDEAL '+devShown.toFixed(1)+'%';
+    case S.EXCHANGE: return 'LIVE · DEVIATION FROM IDEAL '+devShown.toFixed(1)+'% · PERCENTILE '+Math.round(pctShown);
+    case S.GRADING: return '';                                                 // the ranked-population composition carries it — no faint ribbon under the verdict
+    case S.STRESS: return 'ELASTICITY TEST · SAMPLE HELD';
+    case S.DISASSEMBLE: return 'SEGMENTING · 06 SUB-REGIONS';
+    case S.DELTA: return 'GAP TO IDEAL 2026 · '+devShown.toFixed(1)+'%';
+    case S.NOSE: return 'NASAL · PRELIMINARY SAMPLE FILED · IDEAL NOT LOADED';
+    case S.IDEAL_ALONE: return 'THE IDEAL LIPS · 2026 EDITION · MEAN OF ALL';
+    case S.ASSEMBLE: return 'CORRECTING TOWARD IDEAL · '+pad(normPct,2)+'% · Δ '+devShown.toFixed(1)+'% → 0.0%';
+    case S.ABSORB: return 'CORRECTED · YOUR SAMPLE NOW MATCHES THE IDEAL';
+    case S.ARCHIVE: return 'ALL SAMPLES CORRECTED TO ONE IDEAL';
+  }
+  return '';
+}
+
+/* ---------- mapping rings → pixels ---------- */
+function ringPx(ring){ const R=mouthRect(); return ring? ring.map(([uu,v])=>[R.x+uu*R.w,R.y+v*R.h]) : null; }
+function strokeRing(P,style,w,dash){ if(!P)return; xc.save(); if(dash)xc.setLineDash(dash); xc.strokeStyle=style; xc.lineWidth=w;
+  xc.beginPath(); P.forEach((p,i)=> i?xc.lineTo(p[0],p[1]):xc.moveTo(p[0],p[1])); xc.closePath(); xc.stroke(); xc.restore(); }
+function reticle(R){ const cx=R.x+R.w/2, cy=R.y+R.h/2, g=14;                  // open crosshair — never covers the centroid
+  xc.save(); xc.strokeStyle=CY+'0.8)'; xc.lineWidth=1;
+  xc.beginPath(); xc.moveTo(cx-44,cy); xc.lineTo(cx-g,cy); xc.moveTo(cx+g,cy); xc.lineTo(cx+44,cy);
+  xc.moveTo(cx,cy-44); xc.lineTo(cx,cy-g); xc.moveTo(cx,cy+g); xc.lineTo(cx,cy+44); xc.stroke(); xc.restore(); }
+
+/* ---------- ACQUIRE: stepped scan + isolation contour ---------- */
+function drawAcquire(k){
+  const R=mouthRect(); const ring=ringPx(frozen?capLip:liveRing);
+  if(scanY>=0){ const y=scanY*sizePx; xc.save();                               // 2px stepped scan line (white lead + cyan core)
+    xc.strokeStyle=WHITE; xc.lineWidth=1; xc.beginPath(); xc.moveTo(R.x-10,y-1); xc.lineTo(R.x+R.w+10,y-1); xc.stroke();
+    xc.strokeStyle=CYAN; xc.lineWidth=1; xc.beginPath(); xc.moveTo(R.x-10,y); xc.lineTo(R.x+R.w+10,y); xc.stroke(); xc.restore(); }
+  if(ring){ const n=Math.max(2,Math.floor(k*ring.length*1.6)+2);              // isolation contour locks point by point
+    xc.save(); xc.strokeStyle=CY+'0.85)'; xc.lineWidth=1.2; xc.beginPath();
+    for(let i=0;i<n;i++){ const p=ring[i%ring.length]; i?xc.lineTo(p[0],p[1]):xc.moveTo(p[0],p[1]); } xc.stroke();
+    for(let i=0;i<ring.length;i+=4){ const p=ring[i]; xc.strokeStyle=CY+'0.6)'; xc.beginPath(); xc.moveTo(p[0]-3,p[1]); xc.lineTo(p[0]+3,p[1]); xc.stroke(); }
+    xc.restore(); }
+  reticle(R);
+}
+/* ---------- COMPARE: your mouth REPLACED by each catalog mouth in turn + the nearest-neighbour match ---------- */
+function drawCompare(k){
+  const R=mouthRect(), ins=INSET();
+  const ready = SWAP && swapMouths.length;
+  // RESULT — once the real flux swap has baked, reveal the SEAMLESS swapped mouth (the donor mouth inpainted onto your face)
+  if(ready){ const cur=Math.floor(st/0.5)%swapMouths.length; drawSwapPatch(swapMouths[cur],R);
+    xc.strokeStyle=CY+'0.85)'; xc.lineWidth=1; xc.strokeRect(R.x+0.5,R.y+0.5,R.w-1,R.h-1);
+    ctext('GRAFT · DONOR-'+pad(cur+1,2), R.x, R.y-3, {size:8,col:WHITE,cap:true}); }
+  reticle(R);
+  // COMPARISON — candidate donor list with match %, nearest-neighbour resolving, closest highlighted
+  const N=8; let best=0,bestv=-1; const mval=i=>clamp(38+rnd(i*3+count*2)*54+resolvePct*0.18,0,99);
+  for(let i=0;i<N;i++){ const v=mval(i); if(v>bestv){bestv=v;best=i;} }
+  ctext('REGIONAL POPULATION · NEAREST SAMPLES', ins, ins+22, {size:7,col:CY+'0.6)',cap:true});
+  for(let i=0;i<N;i++){ const y=ins+36+i*16, isbest=(i===best&&resolvePct>72);
+    ctext((isbest?'▸':' ')+'SAMPLE-'+pad(i+1,2), ins, y, {size:8,col:isbest?WHITE:CY+'0.5)'});
+    ctext('MATCH '+mval(i).toFixed(0)+'%', ins+118, y, {size:8,col:isbest?WHITE:CY+'0.6)'}); }
+  ctext(ready?('SAMPLING POPULATION · '+fmt(regionalSamples)+' SAMPLES'):'RETRIEVING THE IDEAL LIPS · 2026 EDITION', sizePx/2, R.y+R.h+30, {size:8,col:CY+'0.7)',cap:true,align:'center'});
+  ctext((ready?'MATCHED  ':'RETRIEVING  ')+pad(resolvePct,2)+'%', sizePx/2, R.y+R.h+54, {size:TZ().title,col:CYAN,cap:true,align:'center',track:1});
+  if(ready) ctext('CLOSEST SAMPLE · '+bestv.toFixed(0)+'% MATCH', sizePx/2, R.y+R.h+72, {size:TZ().micro,col:CYAN,cap:true,align:'center',track:1});
+}
+
+/* ---------- MEASURE: real coordinate dump + classification + headline deviation ---------- */
+/* real lip morphometry from the captured ring — honest geometry, in mm */
+/* generic ring morphometry — robust to ANY part ring length (lips 20 · nose 14 · eyes 16) */
+function lipMetrics(P){ P=P||ringPx(capLip); if(!P||P.length<6) return null; const n=P.length, sc=120/sizePx;
+  let minx=1e9,maxx=-1e9,miny=1e9,maxy=-1e9,li=0,ri=0,ti=0,bi=0;
+  for(let i=0;i<n;i++){ const p=P[i]; if(p[0]<minx){minx=p[0];li=i;} if(p[0]>maxx){maxx=p[0];ri=i;} if(p[1]<miny){miny=p[1];ti=i;} if(p[1]>maxy){maxy=p[1];bi=i;} }
+  const W=(maxx-minx)/sizePx*120, H=(maxy-miny)/sizePx*120;
+  let A=0,per=0,cx=0,cy=0; for(let i=0;i<n;i++){ const a=P[i],b=P[(i+1)%n]; A+=a[0]*b[1]-b[0]*a[1]; per+=Math.hypot(a[0]-b[0],a[1]-b[1]); cx+=a[0]; cy+=a[1]; }
+  const area=Math.abs(A)/2*sc*sc, perim=per*sc; cx/=n; cy/=n;
+  let upV=0,loV=0,un=0,ln=0; for(const p of P){ if(p[1]<cy){upV+=cy-p[1];un++;} else {loV+=p[1]-cy;ln++;} } upV=(un?upV/un:0)/sizePx*120; loV=(ln?loV/ln:0)/sizePx*120;
+  let sxx=0,syy=0,sxy=0; for(const p of P){ const dx=p[0]-cx,dy=p[1]-cy; sxx+=dx*dx; syy+=dy*dy; sxy+=dx*dy; }
+  const orient=0.5*Math.atan2(2*sxy,sxx-syy)*180/Math.PI;
+  const sN=centerScale(P), syN=symmetrize(sN); let sd=0; for(let i=0;i<n;i++) sd+=Math.hypot(sN[i][0]-syN[i][0], sN[i][1]-syN[i][1]); sd/=n;   // asymmetry residual
+  const symIdx=clamp(100 - sd*170, 0, 100);
+  const a=P[(ti-1+n)%n], b=P[(ti+1)%n], v1=[a[0]-P[ti][0],a[1]-P[ti][1]], v2=[b[0]-P[ti][0],b[1]-P[ti][1]];   // apex angle at the top vertex
+  const cb=Math.acos(clamp((v1[0]*v2[0]+v1[1]*v2[1])/((Math.hypot(v1[0],v1[1])*Math.hypot(v2[0],v2[1]))||1),-1,1))*180/Math.PI;
+  return {W,H,ratio:W/Math.max(0.1,H),upV,loV,vr:upV/Math.max(0.1,loV),area,perim,orient,symIdx,cb,li,ri,ti,bi};
+}
+/* a caliper gauge (jaws + ruler + mm) clamping a span — you feel measured */
+function caliper(ax,ay,bx,by,off,label,vert){ xc.save(); xc.strokeStyle=CY+'0.85)'; xc.lineWidth=1;
+  if(vert){ const gx=Math.max(ax,bx)+off;
+    xc.beginPath(); xc.moveTo(ax,ay); xc.lineTo(gx+6,ay); xc.moveTo(bx,by); xc.lineTo(gx+6,by); xc.moveTo(gx,ay); xc.lineTo(gx,by); xc.stroke();
+    for(let t=0;t<=8;t++){ const y=lerp(ay,by,t/8); xc.beginPath(); xc.moveTo(gx,y); xc.lineTo(gx+(t%4?3:6),y); xc.stroke(); }
+    xc.restore(); ctext(label, gx+11, (ay+by)/2+3, {size:TZ().label,col:CYAN,cap:true,track:0.5}); }
+  else { const gy=Math.max(ay,by)+off;
+    xc.beginPath(); xc.moveTo(ax,ay); xc.lineTo(ax,gy+6); xc.moveTo(bx,by); xc.lineTo(bx,gy+6); xc.moveTo(ax,gy); xc.lineTo(bx,gy); xc.stroke();
+    for(let t=0;t<=10;t++){ const x=lerp(ax,bx,t/10); xc.beginPath(); xc.moveTo(x,gy-(t%5?3:6)); xc.lineTo(x,gy); xc.stroke(); }
+    xc.restore(); ctext(label, (ax+bx)/2, gy+16, {size:TZ().label,col:CYAN,cap:true,align:'center',track:0.5}); } }
+/* ===== duotone MEASUREMENT layers — cyan = geometry · magenta = calculation · a separate text/label layer ===== */
+const gstep=()=>Math.floor(T*18), gj=(s,a)=>((rnd(s*1.7+gstep())-0.5)*2*(a||1));   // ~55ms stepped glitch jitter (the machine "computing")
+function pad3(n){ return pad(n,3); }
+function cross(p,r){ xc.beginPath(); xc.moveTo(p[0]-r,p[1]); xc.lineTo(p[0]+r,p[1]); xc.moveTo(p[0],p[1]-r); xc.lineTo(p[0],p[1]+r); xc.stroke(); }
+// LAYER 1 · COLOUR — the measurement graticule + a sweeping scanline (behind the geometry)
+function mgGrid(R){ xc.save();
+  xc.strokeStyle=CY+'0.06)'; xc.lineWidth=1;
+  for(let i=0;i<=10;i++){ const x=R.x+i/10*R.w; xc.beginPath(); xc.moveTo(x,R.y-R.h*0.16); xc.lineTo(x,R.y+R.h*1.16); xc.stroke(); }
+  for(let i=0;i<=6;i++){ const y=R.y+i/6*R.h; xc.beginPath(); xc.moveTo(R.x-R.w*0.06,y); xc.lineTo(R.x+R.w*1.06,y); xc.stroke(); }
+  const sy=R.y+((T*0.5)%1)*R.h; xc.strokeStyle=CY+'0.30)'; xc.lineWidth=1.2; xc.beginPath(); xc.moveTo(R.x-10,sy); xc.lineTo(R.x+R.w+10,sy); xc.stroke();
+  xc.restore(); }
+// LAYER 2 · CALCULATION — a live coord code at every landmark (cyan) + the W/H dimension cross (bright)
+function mgCalc(P,m){ xc.save(); const g=gstep(); xc.font="8px 'PP Fraktion Mono',monospace";
+  xc.strokeStyle=CY+'0.9)'; xc.lineWidth=1; xc.fillStyle=CY+'0.9)';
+  for(let i=0;i<P.length;i++){ const p=P[i]; cross(p,3); xc.fillText(pad3(i)+':'+(rnd(i*7+g)*9.9).toFixed(2), p[0]+4, p[1]-2+gj(i,1.1)); }
+  if(m){ const Lc=P[m.li],Rc=P[m.ri],Tp=P[m.ti],Bp=P[m.bi];
+    xc.strokeStyle='rgba(255,255,255,0.5)'; xc.beginPath(); xc.moveTo(Lc[0],Lc[1]); xc.lineTo(Rc[0],Rc[1]); xc.moveTo(Tp[0],Tp[1]); xc.lineTo(Bp[0],Bp[1]); xc.stroke();
+    xc.fillStyle='rgba(255,255,255,0.95)'; xc.font="11px 'PP Fraktion Mono',monospace";
+    const hx=(Lc[0]+Rc[0])/2, hy=(Lc[1]+Rc[1])/2, vx=(Tp[0]+Bp[0])/2, vy=Tp[1]+(Bp[1]-Tp[1])*0.30;
+    xc.fillText('W '+m.W.toFixed(1)+'mm', hx-30, hy+16);                       // width label below the horizontal line
+    xc.fillText('H '+m.H.toFixed(1)+'mm', vx+8, vy); }                         // height label up the vertical line (no overlap)
+  xc.restore(); }
+// LAYER 3 · TEXT — corner telemetry / IDs (magenta), derived from the real metrics
+function mgText(R,m){ xc.save(); xc.font="8px 'PP Fraktion Mono',monospace"; xc.fillStyle=MG+'0.95)'; xc.textBaseline='alphabetic';
+  const vol=m?Math.round(clamp(m.area/8.5,20,99)):82, asym=m?Math.max(0,(100-m.symIdx)*0.11):4.9;
+  xc.fillText('VOL '+vol+'%', R.x, R.y-R.h*0.13);
+  xc.textAlign='right'; xc.fillText('ASYM '+asym.toFixed(1)+'°', R.x+R.w, R.y-R.h*0.13); xc.textAlign='left';
+  xc.fillText('SPEC №'+pad3(count), R.x, R.y+R.h*1.15);
+  xc.restore(); }
+function drawMeasure(k){
+  const R=mouthRect(), ring=ringPx(capLip), m=lipMetrics(); if(!m||!ring) return;
+  mgGrid(R);                                                   // colour layer
+  strokeRing(ring, CYAN, 1.6);                                 // geometry
+  mgCalc(ring, m);                                             // calculation layer (dense per-landmark + W/H cross)
+  mgText(R, m);                                                // text layer (VOL · ASYM · SPEC №)
+}
+/* ---------- DISASSEMBLE: segment into labelled sub-regions, each measured ---------- */
+const SUBR=[['UPPER LIP',0.18],['LOWER LIP',0.30],["CUPID'S BOW",0.46],['ORAL COMMISURE',0.62],['VERMILION',0.78],['CENTRAL VOLUME',0.92]];
+const PARTS=[ {sx:0.15,sy:0.05,sw:0.70,sh:0.42,dx:0,dy:-1},{sx:0.15,sy:0.52,sw:0.70,sh:0.43,dx:0,dy:1},
+  {sx:0.00,sy:0.28,sw:0.30,sh:0.46,dx:-1.2,dy:0},{sx:0.70,sy:0.28,sw:0.30,sh:0.46,dx:1.2,dy:0},{sx:0.36,sy:0.36,sw:0.28,sh:0.30,dx:0,dy:0} ];
+const segOff=document.createElement('canvas'); segOff.width=segOff.height=240; const segCtx=segOff.getContext('2d');
+function drawSegPart(sx,sy,sw,sh,dx,dy,dw,dh){ segCtx.clearRect(0,0,240,240); try{ segCtx.drawImage(cropCv,sx,sy,sw,sh,0,0,240,240);}catch(e){return;}
+  segCtx.globalCompositeOperation='destination-in'; const g=segCtx.createRadialGradient(120,120,52,120,120,140);
+  g.addColorStop(0,'#000'); g.addColorStop(0.6,'#000'); g.addColorStop(1,'rgba(0,0,0,0)'); segCtx.fillStyle=g; segCtx.fillRect(0,0,240,240);
+  segCtx.globalCompositeOperation='source-over'; xc.drawImage(segOff,0,0,240,240,dx,dy,dw,dh); }
+const PART_TAGS=['UPPER','LOWER','CORNER_L','CORNER_R','VOL'];
+function drawDisassemble(k){
+  if(!hasCrop) return; const R=mouthRect(), W=cropCv.width,H=cropCv.height, g=gstep();
+  const e=(DEBUG&&window.__holdE!=null)?window.__holdE:Math.sin(clamp(k,0,1)*Math.PI);
+  PARTS.forEach((P,idx)=>{ const dw=R.w*P.sw,dh=R.h*P.sh,bx=R.x+P.sx*R.w+dw/2,by=R.y+P.sy*R.h+dh/2;
+    const px=bx+P.dx*R.w*0.16*e, py=by+P.dy*R.h*0.24*e;
+    drawSegPart(P.sx*W,P.sy*H,P.sw*W,P.sh*H, px-dw/2,py-dh/2, dw,dh);
+    if(e>0.25){ xc.save(); xc.strokeStyle=MG+'0.45)'; xc.lineWidth=1; cross([px,py],5); xc.restore();   // magenta registration cross
+      ctext('▸'+PART_TAGS[idx]+' '+pad3(idx+1), px-dw/2, py-dh/2-4, {size:8,col:CY+'0.85)',cap:true});   // text layer (label)
+      ctext((rnd(idx*3+g)*6+2).toFixed(1)+'mm', px-dw/2, py+dh/2+12, {size:8,col:MG+'0.9)'}); } });        // calculation layer (mm)
+}
+/* ---------- DELTA: the AVERAGE template as target; the gap ---------- */
+function refitRing(srcN, ring){ if(!srcN||!ring) return null;
+  let cx=0,cy=0; for(const[x,y]of ring){cx+=x;cy+=y;} cx/=ring.length;cy/=ring.length;
+  let s=0; for(const[x,y]of ring){s+=(x-cx)*(x-cx)+(y-cy)*(y-cy);} s=Math.sqrt(s/ring.length)||1;
+  let sx=0,sy=0; for(const[x,y]of srcN){sx+=x;sy+=y;} sx/=srcN.length;sy/=srcN.length;
+  let ss=0; for(const[x,y]of srcN){ss+=(x-sx)*(x-sx)+(y-sy)*(y-sy);} ss=Math.sqrt(ss/srcN.length)||1;
+  return ring.map((p,i)=>{ const j=Math.floor(i/ring.length*srcN.length)%srcN.length; return [cx+(srcN[j][0]-sx)/ss*s, cy+(srcN[j][1]-sy)/ss*s]; }); }
+function drawDelta(k){ ensureIdeal();
+  const ring=ringPx(capLip), m=lipMetrics(ring); const tpN=(curPart.flesh&&idealReady&&refitRing(idealRingN,capLip))||meanTemplateFor(capLip); const tp=tpN?ringPx(tpN):null; if(!ring||!tp) return;
+  const R=mouthRect();
+  strokeRing(ring, CYAN, 1.4);                                                 // YOUR outline — cyan geometry
+  let cx=0,cy=0; ring.forEach(([x,y])=>{cx+=x;cy+=y;}); cx/=ring.length; cy/=ring.length;
+  for(let c=0;c<3;c++){ const sc=1.10+c*0.05+gj(c*3,0.025);                    // MAGENTA candidate templates flickering outward
+    strokeRing(ring.map(([x,y])=>[cx+(x-cx)*sc, cy+(y-cy)*(sc+0.16)]), MG+(0.22+0.14*c).toFixed(2)+')', 1, [3,3]); }
+  strokeRing(tp, MG+'0.9)', 1.7, [6,3]);                                       // the locked target template
+  for(let i=0;i<ring.length;i+=3) arrow(ring[i], tp[i], MG+'0.72)', 1);        // magenta gap arrows
+  ctext('Δ +'+Math.max(1,Math.round(devShown))+'%', R.x+R.w/2, R.y-R.h*0.12, {size:22,col:MAG,cap:true,align:'center',track:1});
+  ctext('TPL-'+pad3((count%23)+1), R.x, R.y-R.h*0.12, {size:8,col:MG+'0.9)',cap:true,track:1});
+  ctext('REF '+(m?m.upV.toFixed(1):'5.2')+'mm', R.x+R.w, R.y-R.h*0.12, {size:8,col:MG+'0.9)',align:'right',cap:true,track:1});
+}
+/* ---------- ASSEMBLE: normalize the specimen toward the mean ---------- */
+function drawAssemble(k){
+  const ring=ringPx(capLip), tp=ringPx(meanTemplateFor(capLip)); if(!ring||!tp) return;
+  const cur=ring.map((p,i)=>[lerp(p[0],tp[i][0],k), lerp(p[1],tp[i][1],k)]);
+  strokeRing(tp, WHITE, 1, [5,4]); strokeRing(cur, CYAN, 1.3);
+  const R=mouthRect(); ctext('NORMALIZE '+pad(normPct,2)+'%', R.x+R.w/2, R.y-12, {size:22,col:CYAN,cap:true,align:'center',track:1});   // TITLE, no bold
+}
+/* ---------- ARCHIVE: 64 records, 1 shape (the cold punchline) ---------- */
+function drawArchive(k){
+  const ins=INSET(), R={x:ins+2,y:ins+2,w:sizePx-2*ins-4,h:sizePx-2*ins-4};
+  const N=8, cell=Math.min(R.w,R.h)/N, gx=R.x+(R.w-cell*N)/2, gy=R.y+(R.h-cell*N)/2;
+  const total=N*N, shown=Math.min(total, Math.floor(smoothstep(0,0.7,k)*total*1.1));   // stamp in row by row, fast
+  const src=(hasCrop?cropCv:null);
+  for(let idx=0; idx<shown; idx++){ const r=Math.floor(idx/N), c=idx%N, x=gx+c*cell, y=gy+r*cell;
+    xc.save(); xc.beginPath(); xc.rect(x+1,y+1,cell-2,cell-2); xc.clip();
+    if(src){ const a=cropAspect; let dw=cell-2,dh=(cell-2)/a; if(dh<cell-2){ dh=cell-2; dw=dh*a; }
+      xc.globalAlpha=0.92; xc.drawImage(src, x+(cell-2-dw)/2+1, y+(cell-2-dh)/2+1, dw, dh);
+      xc.fillStyle='rgba(0,40,40,0.45)'; xc.fillRect(x+1,y+1,cell-2,cell-2);   // every record cooled to the same dead tone
+    } else { xc.fillStyle='rgba(0,30,28,0.7)'; xc.fillRect(x+1,y+1,cell-2,cell-2); }
+    xc.restore();
+    xc.strokeStyle=CY+'0.35)'; xc.lineWidth=1; xc.strokeRect(x+0.5,y+0.5,cell,cell);
+    ctext(pad(rnd(idx*7+1)*99999,5), x+3, y+cell-9, {size:6,col:CY+'0.7)'});   // distinct id...
+    ctext('Δ 0.0', x+3, y+cell-3, {size:6,col:CY+'0.5)'});                     // ...identical shape
+  }
+}
+
+/* ===========================  FACE OPENING — recognition · purge · stress  =========================== */
+function convexHull(pts){ if(pts.length<3) return pts.slice();
+  const p=pts.slice().sort((a,b)=>a[0]-b[0]||a[1]-b[1]); const cr=(o,a,b)=>(a[0]-o[0])*(b[1]-o[1])-(a[1]-o[1])*(b[0]-o[0]);
+  const lo=[]; for(const q of p){ while(lo.length>=2&&cr(lo[lo.length-2],lo[lo.length-1],q)<=0)lo.pop(); lo.push(q); }
+  const up=[]; for(let i=p.length-1;i>=0;i--){ const q=p[i]; while(up.length>=2&&cr(up[up.length-2],up[up.length-1],q)<=0)up.pop(); up.push(q); }
+  lo.pop(); up.pop(); return lo.concat(up); }
+function clipHull(h){ xc.beginPath(); h.forEach((p,i)=>i?xc.lineTo(p[0],p[1]):xc.moveTo(p[0],p[1])); xc.closePath(); }
+function faceScreenPts(L,plate){ const a=new Array(468); for(let i=0;i<468;i++) a[i]=faceVtx(L,i,plate); return a; }
+function drawFaceVideo(plate,hull){
+  xc.save(); if(hull){ clipHull(hull); xc.clip(); }
+  if(camOK&&vid.readyState>=2&&vid.videoWidth){ const b=faceBox,vw=vid.videoWidth,vh=vid.videoHeight;
+    xc.translate(plate.x+plate.w,plate.y); xc.scale(-1,1);
+    try{ xc.drawImage(vid,(b.cx-b.hx)*vw,(b.cy-b.hy)*vh,2*b.hx*vw,2*b.hy*vh,0,0,plate.w,plate.h); }catch(e){}
+  } else { xc.fillStyle='rgba(0,22,20,0.6)'; xc.fillRect(plate.x,plate.y,plate.w,plate.h); }
+  xc.restore(); }
+function drawMesh(L,pts,o){ o=o||{};
+  const live=o.live||(()=>true), pos=o.pos||(i=>pts[i]);
+  xc.save(); xc.globalCompositeOperation='lighter';
+  xc.strokeStyle=CY+'0.6)'; xc.lineWidth=1; xc.beginPath();
+  for(const e of faceEdges){ const a=e[0],b=e[1]; if(!live(a)||!live(b)) continue; if(o.inkEdge&&!o.inkEdge(a,b)) continue;
+    const pa=pos(a),pb=pos(b); if(!pa||!pb) continue; xc.moveTo(pa[0],pa[1]); xc.lineTo(pb[0],pb[1]); }
+  xc.stroke();
+  for(let i=0;i<468;i++){ if(!live(i)) continue; if(o.inkNode&&!o.inkNode(i)) continue; const p=pos(i); if(!p) continue;
+    xc.fillStyle=CY+'0.8)'; xc.fillRect(p[0]-1,p[1]-1,2,2); }                          // sample-points = squares, not circles
+  if(o.accent) for(const i of ACCENT){ if(!live(i)) continue; const p=pos(i); if(!p) continue; xc.fillStyle=WHITE; xc.fillRect(p[0]-1.5,p[1]-1.5,3,3); }
+  xc.restore(); }
+function plateLabel(plate){ ctext('SUBJECT — 01', plate.x, plate.y-7, {size:11,col:CY+'0.7)',cap:true,track:1}); }
+/* ---------- EXCHANGE: the cold gaze runs measurements on the live flesh — DEVIATION FROM IDEAL ticking ---------- */
+function drawExchange(k){
+  const R=mouthRect(), rn=frozen?capLip:liveRing, ring=ringPx(rn), ideal=ringPx(meanTemplateFor(rn)); reticle(R);
+  if(ideal) strokeRing(ideal, CY+'0.7)', 1.3, [6,4]);                           // the IDEAL target pinned on your live flesh
+  if(ring){ strokeRing(ring, CYAN, 1.3);
+    for(let i=0;i<ring.length;i+=2){ const p=ring[i]; xc.save(); xc.strokeStyle=CY+'0.4)'; xc.lineWidth=1;
+      xc.beginPath(); xc.moveTo(p[0]-3,p[1]); xc.lineTo(p[0]+3,p[1]); xc.moveTo(p[0],p[1]-3); xc.lineTo(p[0],p[1]+3); xc.stroke(); xc.restore(); } }
+  drawCorrections(rn);                                                          // TRUE correction arrows toward the ideal
+}
+/* ---------- GRADING (Rev5): the ranked population is SEEN, then the sentence lands ---------- */
+function drawLipTile(img,x,y,w,h,bright){ xc.save(); xc.beginPath(); xc.rect(x,y,w,h); xc.clip();
+  if(img){ const a=img.naturalWidth/img.naturalHeight; let dw=w,dh=w/a; if(dh<h){dh=h;dw=h*a;}
+    xc.filter='grayscale(1) contrast(1.06) brightness(1.05)';                    // NORMALISE colour → every specimen is the same tone, so the comparison is SHAPE not colour
+    xc.drawImage(img,x+(w-dw)/2,y+(h-dh)/2,dw,dh); xc.filter='none';
+    if(!bright){ xc.fillStyle='rgba(0,20,18,0.34)'; xc.fillRect(x,y,w,h); } }
+  else { xc.fillStyle='rgba(0,22,20,0.6)'; xc.fillRect(x,y,w,h); }
+  xc.restore(); xc.strokeStyle=bright?CYAN:CY+'0.4)'; xc.lineWidth=bright?1.5:1; xc.strokeRect(x+0.5,y+0.5,w-1,h-1); }
+function nearestNeighbors(){ const p=pctShown; let above=null, below=null;                 // the specific lips ranked just above / below YOU
+  for(const e of LIP_RANK){ if(e.pct>p && (!above||e.pct<above.pct)) above=e; if(e.pct<p && (!below||e.pct>below.pct)) below=e; }
+  return {above,below}; }
+function drawNeighbors(cx, cy, slotW){ const t=TZ(), {above,below}=nearestNeighbors(); const h=slotW*0.64, gap=slotW*0.22;
+  const cells=[ {img:below?lipImgs[below.img]:null, lab:below?ord(below.pct):'—', you:false},
+    {img:null, lab:ord(Math.round(pctShown)), you:true},
+    {img:above?lipImgs[above.img]:null, lab:above?ord(above.pct):'—', you:false} ];   // BELOW · YOU · ABOVE (ideal is to the right)
+  const totalW=slotW*3+gap*2, x0=cx-totalW/2, y=cy-h/2;
+  for(let i=0;i<3;i++){ const s=cells[i], x=x0+i*(slotW+gap);
+    if(s.you) drawCapMouth(x,y,slotW,h); else drawLipTile(s.img,x,y,slotW,h,false);
+    ctext(s.you?'YOU':'SAMPLE', x+slotW/2, y-9, {size:t.micro,col:s.you?CYAN:CY+'0.5)',cap:true,align:'center',track:1});
+    ctext(s.lab, x+slotW/2, y+h+16, {size:s.you?t.body:t.label,col:s.you?CYAN:CY+'0.6)',cap:true,align:'center',track:1});
+    if(i<2){ ctext('›', x+slotW+gap/2, y+h/2+4, {size:t.body,col:CY+'0.35)',align:'center'}); } }   // › points toward the ideal (higher percentile, to the right)
+  ctext('THESE LIPS RANK ABOVE AND BELOW YOURS', cx, cy+h/2+34, {size:t.micro,col:CY+'0.45)',cap:true,align:'center',track:1.5}); }
+function fitText(s, targetW, maxPx){ xc.save(); xc.font=maxPx+"px 'PP Fraktion Mono',monospace"; xc.letterSpacing='1px'; const w=xc.measureText(s).width; xc.restore(); return w>targetW? Math.floor(maxPx*targetW/w): maxPx; }
+function drawVerdictStamp(){ const S=sizePx, age=st-9.6, sc=age<0.05?1.07:(age<0.13?lerp(1.07,1.0,(age-0.05)/0.08):1.0);
+  const cls=(verdict?verdict.cls:classifyDev(devShown)), pc=(verdict?verdict.pct:Math.round(pctShown));
+  const t=TZ(), csz=fitText(cls, S*0.84, Math.round(S*0.08));
+  ctext('VERDICT', S/2, S*0.375, {size:t.label,col:CY+'0.6)',cap:true,align:'center',track:7});
+  xc.save(); xc.translate(S/2, S*0.46); xc.scale(sc,sc); ctext(cls, 0, 0, {size:csz,col:WHITE,cap:true,align:'center',track:1}); xc.restore();   // HERO headline — WHITE; the percentile below stays cyan (measurement)
+  ctext(ord(pc)+' PERCENTILE', S/2, S*0.545, {size:t.title,col:CYAN,cap:true,align:'center',track:2});
+  ctext('OF '+fmt(regionalSamples)+' REGIONAL SAMPLES', S/2, S*0.575, {size:t.label,col:CY+'0.5)',cap:true,align:'center',track:2}); }
+function drawGrading(k){ ensureIdeal(); const S=sizePx, t=TZ();
+  const P_END=5.0, N_END=8.4, F_END=9.6, heroW=S*0.36, heroH=heroW*0.62, hx=S/2-heroW/2, hy=S*0.285;
+  if(st<P_END){                                                                            // ACT 1 — the ranked parade
+    screenBanner('RANKING YOU AGAINST THE POPULATION', 'REGIONAL POPULATION · SAMPLE PARADE');
+    if(st<P_END-1.0){ const idx=Math.floor(st/0.35)%NLIP, e=LIP_RANK[NLIP-1-idx];          // descend from high percentile toward YOU
+      drawLipTile(lipImgs[e.img], hx, hy, heroW, heroH, false);
+      ctext('SAMPLE Nº '+fmt(e.no), hx, hy+heroH+20, {size:t.label,col:CY+'0.7)',cap:true,track:1});
+      ctext(ord(e.pct)+' PERCENTILE', hx+heroW, hy+heroH+20, {size:t.label,col:CYAN,cap:true,align:'right',track:1}); }
+    else { drawCapMouth(hx,hy,heroW,heroH);                                                 // …and ends on YOU, filed into the lineup
+      ctext('YOU', hx, hy+heroH+20, {size:t.label,col:CYAN,cap:true,track:1.5});
+      ctext(ord(pctShown)+' PERCENTILE', hx+heroW, hy+heroH+20, {size:t.label,col:CYAN,cap:true,align:'right',track:1});
+      ctext('FILED INTO THE LINEUP AS ONE MORE SPECIMEN', S/2, hy+heroH+44, {size:t.micro,col:CY+'0.5)',cap:true,align:'center',track:2}); }
+  } else if(st<F_END){                                                                      // ACT 2 — nearest-ranked neighbours (+ freeze at N_END)
+    screenBanner('RANKING YOU AGAINST THE POPULATION', 'YOUR NEAREST RANK');
+    drawNeighbors(S/2, S*0.44, S*0.21);
+    ctext('DEVIATION '+devShown.toFixed(1)+'%      ·      PERCENTILE '+Math.round(pctShown), S/2, S*0.66, {size:t.label,col:CY+'0.7)',cap:true,align:'center',track:1.5});
+    if(st>=N_END) ctext('· · ·', S/2, S*0.71, {size:t.title,col:CY+'0.4)',align:'center'});   // silence before the verdict
+  } else { screenBanner('RANKING YOU AGAINST THE POPULATION'); drawVerdictStamp(); }         // ACT 3 — the sentence
+}
+/* ---------- IDEAL_ALONE: the mean-of-all lip, alone ---------- */
+function drawIdealAlone(k){
+  ensureIdeal();
+  const t=TZ();
+  drawPartIdeal({x:sizePx*0.15,y:sizePx*0.22,w:sizePx*0.70,h:sizePx*0.56}, clamp(k*3,0,1), true);
+  ctext('THE IDEAL', sizePx/2, sizePx*GY.banner, {size:t.title,col:CYAN,align:'center',cap:true,track:2.5});
+  ctext((curPart.flesh?'MEAN OF ALL':'PERFECT SYMMETRY')+' · BELONGS TO NO ONE · 2026 EDITION', sizePx/2, sizePx*0.87, {size:t.micro,col:CY+'0.85)',align:'center',cap:true,track:1.5});
+  ctext('DEVIATION 0.0', sizePx/2, sizePx*0.905, {size:t.label,col:CYAN,align:'center',cap:true,track:1});
+}
+/* ---------- ABSENCE: the viewer's lip void, a PENDING RECORD fading toward the ideal ---------- */
+function drawAbsence(k){
+  const R=mouthRect(), lr=ringPx(capLip), ir=meanTemplateFor(capLip); let v=null;
+  if(lr&&ir){ const m=smoothstep(0,1,k)*0.6; v=lr.map((p,i)=>{ const j=Math.round(i/lr.length*ir.length)%ir.length; return [lerp(p[0],ir[j][0],m),lerp(p[1],ir[j][1],m)]; }); }
+  if(v){ xc.save(); xc.fillStyle='rgba(0,0,0,0.55)'; xc.beginPath(); v.forEach((p,i)=>i?xc.lineTo(p[0],p[1]):xc.moveTo(p[0],p[1])); xc.closePath(); xc.fill(); xc.restore();
+    strokeRing(v, CY+'0.4)', 1.2, [4,4]); } else reticle(R);
+  screenBanner('PENDING RECORD', 'ENROLLED · AWAITING CORRECTION');
+  ctext('DEVIATION FROM IDEAL  '+devShown.toFixed(1)+'%', sizePx/2, sizePx*0.905, {size:TZ().label,col:CY+'0.7)',align:'center',cap:true,track:1});
+}
+function drawStandby(){ const R=mouthRect(); reticle(R);
+  const yb=R.y+(((T*0.35)%1))*R.h; xc.save(); xc.strokeStyle=CY+'0.4)'; xc.lineWidth=1;   // idle sampling sweep on the grid
+  xc.beginPath(); xc.moveTo(R.x,yb); xc.lineTo(R.x+R.w,yb); xc.stroke(); xc.restore(); }
+function drawFace(k){
+  if(!lastLM||!faceEdges){ drawStandby(); return; }
+  const L=lastLM, plate=facePlate(), pts=faceScreenPts(L,plate), hull=convexHull(pts);
+  drawFaceVideo(plate,hull); plateLabel(plate);
+  const nodeP=clamp(k/0.13,0,1), edgeP=clamp((k-0.13)/0.11,0,1), accent=k>0.24;
+  const ny=i=>(pts[i][1]-plate.y)/plate.h;
+  drawMesh(L,pts,{ inkNode:i=>ny(i)<=nodeP*1.06,                                          // pass A: sample-points top→bottom
+    inkEdge:(a,b)=>ny(a)<=nodeP*1.06&&ny(b)<=nodeP*1.06&&Math.max(faceSeed[a],faceSeed[b])<=edgeP, // pass B: triangulate
+    accent });                                                                            // pass C: white ID points
+}
+/* the face decomposed into LABELLED BODY-PART tiles, struck in priority order, mouth retained (Scan/Consent register) */
+function partBoxes(L,plate){
+  const N=11, sx=Array(N).fill(1e9),sy=Array(N).fill(1e9),ex=Array(N).fill(-1e9),ey=Array(N).fill(-1e9);
+  const vx0=Array(N).fill(1e9),vy0=Array(N).fill(1e9),vx1=Array(N).fill(-1e9),vy1=Array(N).fill(-1e9);
+  for(let i=0;i<468;i++){ const r=faceRegion[i]; const p=faceVtx(L,i,plate);
+    if(p[0]<sx[r])sx[r]=p[0]; if(p[1]<sy[r])sy[r]=p[1]; if(p[0]>ex[r])ex[r]=p[0]; if(p[1]>ey[r])ey[r]=p[1];
+    const vx=L[i].x,vy=L[i].y; if(vx<vx0[r])vx0[r]=vx; if(vy<vy0[r])vy0[r]=vy; if(vx>vx1[r])vx1[r]=vx; if(vy>vy1[r])vy1[r]=vy; }
+  const out=[]; for(let r=0;r<N;r++){ if(ex[r]<sx[r]){ out.push(null); continue; } const pd=7;
+    out.push({ d:{x:sx[r]-pd,y:sy[r]-pd,w:ex[r]-sx[r]+2*pd,h:ey[r]-sy[r]+2*pd}, s:{x:vx0[r],y:vy0[r],w:vx1[r]-vx0[r],h:vy1[r]-vy0[r]} }); }
+  return out;
+}
+function drawTile(box,dst,frameAlpha){                                                    // sharp body-part cut-out (no blur)
+  xc.save(); xc.beginPath(); xc.rect(dst.x,dst.y,dst.w,dst.h); xc.clip();
+  if(camOK&&vid.readyState>=2&&vid.videoWidth){ const vw=vid.videoWidth,vh=vid.videoHeight;
+    xc.translate(dst.x+dst.w,dst.y); xc.scale(-1,1);
+    try{ xc.drawImage(vid, box.s.x*vw,box.s.y*vh,box.s.w*vw,box.s.h*vh, 0,0,dst.w,dst.h); }catch(e){}
+  } else { xc.fillStyle='rgba(0,22,20,0.6)'; xc.fillRect(dst.x,dst.y,dst.w,dst.h); }
+  xc.restore();
+  xc.strokeStyle=CY+(frameAlpha||0.7)+')'; xc.lineWidth=1; xc.strokeRect(dst.x+0.5,dst.y+0.5,dst.w-1,dst.h-1);   // 1px isolation frame
+}
+function drawSwapPatch(m,dst){                                                            // a real endpoint-composited foreign mouth, fitted into the mouth region
+  const ca=m.aspect, ra=dst.w/dst.h; let dw,dh; if(ca>ra){ dh=dst.h; dw=dh*ca; } else { dw=dst.w; dh=dw/ca; }
+  xc.save(); xc.beginPath(); xc.rect(dst.x,dst.y,dst.w,dst.h); xc.clip();
+  try{ xc.drawImage(m.canvas, dst.x+(dst.w-dw)/2, dst.y+(dst.h-dh)/2, dw, dh); }catch(e){}
+  xc.restore();
+}
+function drawDisface(k){
+  if(!lastLM||!faceRegion){ return; } const L=lastLM, plate=facePlate();
+  const boxes=partBoxes(L,plate);
+  let fcx=0,fcy=0,fn=0; for(const b of boxes){ if(b){ fcx+=b.d.x+b.d.w/2; fcy+=b.d.y+b.d.h/2; fn++; } } fcx/=fn||1; fcy/=fn||1;
+  const sep=smoothstep(0.16,0.42,k)*0.16;                                                  // parts ease apart (legible seams), modest
+  const dstart=p=> p>=99?9 : 0.46 + p*0.072;                                               // strike order ocular→mandibular over [0.46,0.82]
+  const mb=boxes[10], mc=mb?[mb.d.x+mb.d.w/2,mb.d.y+mb.d.h/2]:[sizePx/2,sizePx/2];
+  xc.save();
+  if(k>0.84 && mb){                                                                        // converge the retained lips INTO the GL mouth framing → seamless sharp handoff
+    const e=Math.floor(smoothstep(0.84,1.0,k)*3)/3; const R=mouthRect(), Rc=[R.x+R.w/2,R.y+R.h/2];
+    const sc=lerp(1,(R.w*0.92)/mb.d.w,e), cx=lerp(mc[0],Rc[0],e), cy=lerp(mc[1],Rc[1],e);
+    xc.translate(cx,cy); xc.scale(sc,sc); xc.translate(-mc[0],-mc[1]);
+  }
+  if(k<0.14){ const pts=faceScreenPts(L,plate); drawMesh(L,pts,{accent:true}); }           // mesh hands off to the part tiles
+  for(let r=0;r<11;r++){ const b=boxes[r]; if(!b) continue; const meta=BPARTS[r];
+    const ds=dstart(meta.prio), dc=clamp((k-ds)/0.05,0,1);                                 // strike progress
+    if(r!==10 && dc>=1) continue;                                                          // discarded → removed, reveals grid
+    const cx=b.d.x+b.d.w/2, cy=b.d.y+b.d.h/2, s=(r===10)?0:sep;
+    const dst={x:b.d.x+(cx-fcx)*s, y:b.d.y+(cy-fcy)*s, w:b.d.w, h:b.d.h};
+    const swapping=false;   // DISFACE swap removed — the flux swap is revealed in COMPARE once baked                // try foreign mouths on you BEFORE the mouth is fully separated
+    if(swapping){ const idx=Math.floor(T/0.1)%swapMouths.length; drawSwapPatch(swapMouths[idx],dst);
+      xc.strokeStyle=CY+'0.9)'; xc.lineWidth=1; xc.strokeRect(dst.x+0.5,dst.y+0.5,dst.w-1,dst.h-1);
+    } else { drawTile(b,dst, r===10?0.85:0.6); }
+    if(k>0.14){ ctext(swapping?'ARTICULATORY · FITTING':meta.label, dst.x, dst.y-3, {size:7,col:r===10?WHITE:CY+'0.8)'});
+      if(swapping) ctext('DONOR ·'+pad((Math.floor(T/0.1)%swapMouths.length)+1,2), dst.x, dst.y+dst.h+8, {size:6,col:CY+'0.75)'});
+      else if(r!==10) ctext((rnd(r+1)*9+6).toFixed(1)+'mm', dst.x, dst.y+dst.h+8, {size:6,col:CY+'0.5)'}); }
+    if(dc>0&&dc<1){ xc.strokeStyle=WHITE; xc.lineWidth=1; xc.beginPath();                  // struck-through on discard
+      xc.moveTo(dst.x,dst.y+dst.h/2); xc.lineTo(dst.x+dst.w*dc,dst.y+dst.h/2); xc.stroke(); }
+  }
+  xc.restore();
+}
+function drawStress(k){
+  const R=mouthRect(); reticle(R);
+  const cx=R.x+R.w/2, cy=R.y+R.h/2, hw=R.w/2*(1+stretch*0.55);
+  xc.save(); xc.strokeStyle=CYAN; xc.lineWidth=1.4;                                       // the caliper jaws (the force is visible)
+  for(const s of [-1,1]){ const x=cx+s*hw; xc.beginPath(); xc.moveTo(x,cy-26); xc.lineTo(x,cy+26);
+    xc.moveTo(x,cy-26); xc.lineTo(x-s*7,cy-26); xc.moveTo(x,cy+26); xc.lineTo(x-s*7,cy+26); xc.stroke(); }
+  xc.strokeStyle=CY+'0.5)'; xc.setLineDash([3,3]); xc.beginPath(); xc.moveTo(cx-hw,cy); xc.lineTo(cx+hw,cy); xc.stroke(); xc.restore();
+  const wmm=41.2*(1+stretch*0.55), strain=1+stretch*0.55;
+  ctext(stretch>0.96?'MAX STRAIN':('STRAIN '+strain.toFixed(2)+'×'), cx, R.y-10, {size:TZ().title,col:CYAN,cap:true,align:'center',track:1});
+  ctext('WIDTH '+wmm.toFixed(1)+'mm', cx, R.y+R.h+0, {size:TZ().micro,col:CYAN,align:'center'});
+}
+
+/* ===========================  REVISION 4 · AESTHETIC STATISTICS layer  =========================== */
+const MEASURE_STATES=new Set([S.EXCHANGE]);   // only EXCHANGE carries the distribution readout; MEASURE/DELTA now own the dense duotone measurement layers; GRADING owns the parade/verdict
+
+/* 1 · branding header + hairline (drawn every non-report frame) */
+function drawStatHeader(){ const ins=INSET();
+  ctext('AESTHETIC STATISTICS · POPULATION MODEL 2026 · REGIONAL NODE 04', ins, ins-10, {size:11,col:CY+'0.85)',cap:true,track:1});
+  xc.save(); xc.strokeStyle=CY+'0.22)'; xc.lineWidth=1; xc.beginPath(); xc.moveTo(ins,ins-4); xc.lineTo(sizePx-ins,ins-4); xc.stroke(); xc.restore(); }
+
+/* the sentence, shrunk to a persistent corner stamp — it follows you through every later state */
+function drawCornerVerdict(){ if(!verdict) return; const ins=INSET();
+  ctext('VERDICT · '+verdict.cls, sizePx-ins, sizePx*0.885, {size:11,col:CYAN,cap:true,align:'right',track:1});
+  ctext(ord(verdict.pct)+' PERCENTILE', sizePx-ins, sizePx*0.905, {size:8,col:CY+'0.6)',cap:true,align:'right',track:1}); }
+/* 6 · organ queue strip (per-item highlight; the previous organ closes before the next opens) */
+function drawQueue(){ const ins=INSET(), y=ins+10, sz=8; xc.save();
+  xc.font=sz+"px 'PP Fraktion Mono',monospace"; xc.textBaseline='alphabetic'; xc.textAlign='left'; let x=ins;
+  for(let i=0;i<queue.length;i++){ const q=queue[i], seg=q.n+' '+q.label+' — '+q.status;
+    const done=(q.status==='FILED'), active=(q.status!=='QUEUED'&&q.status!=='MODULE PENDING'&&!done);
+    xc.fillStyle= active?WHITE : done?CY+'0.6)' : CY+'0.4)'; xc.fillText(seg,x,y); x+=xc.measureText(seg).width;
+    if(i<queue.length-1){ xc.fillStyle=CY+'0.3)'; xc.fillText('  ·  ',x,y); x+=xc.measureText('  ·  ').width; } }
+  xc.restore(); }
+
+/* SELECT · you choose the region (open mouth to lock the cycling highlight) */
+function drawSelect(k){ if(!lastLM||!faceEdges){ drawStandby(); return; }
+  const L=lastLM, S=sizePx, t=TZ(), pw=S*0.44, plate={x:(S-pw)/2, y:S*0.195, w:pw, h:pw*1.18};   // subject centred in the subject zone; plate bottom meets the region word
+  const hull=convexHull(faceScreenPts(L,plate)); drawFaceVideo(plate,hull);
+  const selIdx=forcePart?PART_ORDER.indexOf(forcePart):selHighlight, part=PART_ORDER[selIdx];
+  for(let i=0;i<PART_ORDER.length;i++){ const p=PART_ORDER[i], on=(i===selIdx), pts=p.ring.map(idx=>faceVtx(L,idx,plate));
+    strokeRing(pts, on?CYAN:CY+'0.22)', on?2:1, on?null:[3,3]); }
+  screenBanner('CHOOSE A REGION TO MEASURE');                                          // shared header — same Y as every screen
+  // the region CHOICE is the main text now (no oversized single word) — TITLE size where the big word sat; active = bright + caret, others dim
+  const oW=S*0.20, ox=S/2-(PART_ORDER.length*oW)/2, oy=S*0.775;
+  for(let i=0;i<PART_ORDER.length;i++){ const on=(i===selIdx), cxi=ox+i*oW+oW/2;
+    ctext((on?'▸  ':'')+PART_ORDER[i].key, cxi, oy, {size:t.title,col:on?WHITE:CY+'0.28)',cap:true,align:'center',track:1}); }
+  // confirm meter — fills only as the mouth is HELD open (dwell), not on instantaneous openness → deliberate, unrushed
+  const pr=clamp(selDwell/0.85,0,1), bw=S*0.20, bx=S/2-bw/2, by=S*0.812;
+  xc.save(); xc.strokeStyle=CY+'0.22)'; xc.lineWidth=1; xc.beginPath(); xc.moveTo(bx,by); xc.lineTo(bx+bw,by); xc.stroke();
+  if(pr>0){ xc.strokeStyle=CYAN; xc.lineWidth=2; xc.beginPath(); xc.moveTo(bx,by); xc.lineTo(bx+bw*pr,by); xc.stroke(); } xc.restore();
+  ctext(pr>0?'HOLD':'TAP A REGION — OR OPEN AND HOLD YOUR MOUTH — TO CONFIRM', S/2, S*0.862, {size:t.label,col:CY+'0.7)',cap:true,align:'center',track:1.5});
+}
+/* 6 · NOSE secondary pass — the machine helps itself to the next organ (live face, NASAL region ticks) */
+function drawNose(k){ if(!lastLM||!faceRegion) return;
+  const L=lastLM, plate=facePlate(), pts=faceScreenPts(L,plate), hull=convexHull(pts);
+  drawFaceVideo(plate,hull);                                              // the live face returns (reads vid directly; frozen unaffected)
+  const boxes=partBoxes(L,plate), nb=boxes[4];                            // region 4 = NASAL
+  if(nb){ const b=nb.d, d={x:b.x+b.w*0.14, y:b.y+b.h*0.34, w:b.w*0.72, h:b.h*0.62};   // drop the brow band → just the nose
+    xc.save(); xc.strokeStyle=CY+'0.85)'; xc.lineWidth=1; xc.strokeRect(d.x+0.5,d.y+0.5,d.w-1,d.h-1);
+    for(let i=0;i<=6;i++){ const tx=d.x+d.w*i/6; xc.beginPath(); xc.moveTo(tx,d.y-4); xc.lineTo(tx,d.y); xc.stroke();
+      const ty=d.y+d.h*i/6; xc.beginPath(); xc.moveTo(d.x-4,ty); xc.lineTo(d.x,ty); xc.stroke(); }
+    xc.restore(); ctext('NASAL', d.x, d.y-6, {size:8,col:CYAN,cap:true,track:1});
+    ctext('PRELIMINARY SAMPLE · FILED', d.x, d.y+d.h+11, {size:8,col:CY+'0.7)',track:1}); }
+  ctext('SUBJECT — 01', plate.x, plate.y-7, {size:11,col:CY+'0.7)',cap:true,track:1}); }
+
+/* 3 · the live personal readout — YOU under calculation: big DEVIATION (L) · distribution (C) · big PERCENTILE (R) */
+function distCurve(t){ t=clamp(t,0,1); return Math.pow(t,1.5)*Math.exp(-3.0*t)/0.079; }
+function drawDistribution(){ const ins=INSET();
+  // shared header. DELTA owns its own 'Δ %' headline at the top → skip the banner there (no collision).
+  if(state!==S.DELTA) screenBanner('SUBJECT UNDER MEASUREMENT', 'SAMPLE Nº '+fmt(sessionSampleNo)+'   ·   REGION '+curPart.key+'   ·   LIVE');
+  // bottom readout strip — HERO data, LABEL captions
+  const t5=TZ(), lblY=sizePx*0.775, numY=sizePx*0.85;
+  ctext('DEVIATION FROM IDEAL', ins, lblY, {size:t5.label,col:CY+'0.6)',cap:true,track:1.5});
+  ctext(devShown.toFixed(1)+'%', ins, numY, {size:t5.hero,col:CYAN});
+  ctext('PERCENTILE', sizePx-ins, lblY, {size:t5.label,col:CY+'0.6)',cap:true,align:'right',track:1.5});
+  ctext(''+Math.round(pctShown), sizePx-ins, numY, {size:t5.hero,col:CYAN,align:'right'});
+  // centre distribution curve — you as a bright dot moving along DEVIATION FROM IDEAL
+  const cw=sizePx*0.32, x0=sizePx*0.5-cw/2, x1=sizePx*0.5+cw/2, yb=sizePx*0.845, h=sizePx*0.085;
+  xc.save(); xc.strokeStyle=CY+'0.5)'; xc.lineWidth=1.2; xc.beginPath();
+  for(let i=0;i<=72;i++){ const t=i/72, X=x0+cw*t, Y=yb-distCurve(t)*h; i?xc.lineTo(X,Y):xc.moveTo(X,Y); } xc.stroke();
+  xc.strokeStyle=CY+'0.2)'; xc.lineWidth=1; xc.beginPath(); xc.moveTo(x0,yb); xc.lineTo(x1,yb); xc.stroke();
+  xc.fillStyle=CY+'0.5)'; xc.beginPath(); xc.arc(x0,yb,2.6,0,6.2832); xc.fill(); xc.restore();
+  ctext('IDEAL · 0', x0, yb+12, {size:t5.micro,col:CY+'0.5)',cap:true,align:'center',track:1});
+  ctext('DEVIATION →', x1, yb+12, {size:t5.micro,col:CY+'0.4)',align:'right',track:1});
+  const t=clamp(devShown/60,0,1), yx=x0+cw*t, yy=yb-distCurve(t)*h;
+  xc.save(); xc.strokeStyle=CY+'0.5)'; xc.lineWidth=1; xc.beginPath(); xc.moveTo(yx,yy); xc.lineTo(yx,yb); xc.stroke();
+  xc.fillStyle=CYAN; xc.beginPath(); xc.arc(yx,yy,4.5,0,6.2832); xc.fill(); xc.restore();
+  ctext('YOU', yx, yy-8, {size:t5.micro,col:CYAN,cap:true,align:'center',track:1}); }
+
+/* 4 · correction directives — TRUE arrows on the live ring toward the ideal (meanShape = the deviation reference) */
+let curDir=null, corrTrackIdx=-1, corrTagIdx=-1, corrTagT=-9;
+function ringCentroid(P){ let cx=0,cy=0; for(const p of P){cx+=p[0];cy+=p[1];} return [cx/P.length,cy/P.length]; }
+function edgeLabel(p,c){ const dx=p[0]-c[0], dy=p[1]-c[1]; return Math.abs(dy)>=Math.abs(dx) ? (dy<0?'UPPER EDGE':'LOWER EDGE') : (dx<0?'LEFT EDGE':'RIGHT EDGE'); }
+function topOffsets(lr,ir,n){ const a=[]; for(let i=0;i<lr.length;i++){ const dx=ir[i][0]-lr[i][0], dy=ir[i][1]-lr[i][1]; a.push({i,dx,dy,mag:Math.hypot(dx,dy)}); } a.sort((p,q)=>q.mag-p.mag); return a.slice(0,n); }
+function arrow(p,q,style,w){ xc.save(); xc.strokeStyle=style; xc.fillStyle=style; xc.lineWidth=w;
+  xc.beginPath(); xc.moveTo(p[0],p[1]); xc.lineTo(q[0],q[1]); xc.stroke(); const ang=Math.atan2(q[1]-p[1],q[0]-p[0]), a=6.5;
+  xc.beginPath(); xc.moveTo(q[0],q[1]); xc.lineTo(q[0]-a*Math.cos(ang-0.42),q[1]-a*Math.sin(ang-0.42)); xc.lineTo(q[0]-a*Math.cos(ang+0.42),q[1]-a*Math.sin(ang+0.42)); xc.closePath(); xc.fill(); xc.restore(); }
+function drawCorrections(ringN){ ensureIdeal(); curDir=null; if(!ringN) return;
+  const lr=ringPx(ringN), ir=ringPx(meanTemplateFor(ringN)); if(!lr||!ir) return;
+  const R=mouthRect(), offs=topOffsets(lr,ir,3), tol=R.h*0.045, top=offs[0];
+  if(corrTrackIdx>=0){ const cur=offs.find(o=>o.i===corrTrackIdx); const m=cur?cur.mag:Math.hypot(ir[corrTrackIdx][0]-lr[corrTrackIdx][0],ir[corrTrackIdx][1]-lr[corrTrackIdx][1]);
+    if(m<tol){ corrTagIdx=corrTrackIdx; corrTagT=T; corrTrackIdx=-1; } }
+  if(corrTrackIdx<0 && top.mag>tol) corrTrackIdx=top.i;
+  for(let j=0;j<offs.length;j++){ const o=offs[j]; if(o.mag<2) continue; const p=lr[o.i], q=ir[o.i], strong=(j===0);
+    arrow(p,q, strong?CYAN:CY+'0.4)', strong?1.5:1);
+    const vert=Math.abs(o.dy)>=Math.abs(o.dx), pv=Math.abs(100*(vert?o.dy/R.h:o.dx/R.w));
+    const g=vert?(o.dy<0?'↑':'↓'):(o.dx<0?'←':'→'), lab=g+' '+(pv<1?pv.toFixed(1):Math.round(pv))+'%';
+    ctext(lab, q[0]+6, q[1]-4, {size:strong?9:6,col:strong?WHITE:CY+'0.55)',cap:strong});
+    if(strong){ const dir=vert?(o.dy<0?'UPWARD':'DOWNWARD'):(o.dx<0?'INWARD':'OUTWARD'); curDir={part:edgeLabel(lr[o.i],ringCentroid(lr)),dir,pct:(pv<1?pv.toFixed(1):Math.round(pv))}; } }
+  if(T-corrTagT<1.5 && corrTagIdx>=0){ const p=lr[corrTagIdx]; ctext('✓ CORRECTED', p[0]+6, p[1]+11, {size:8,col:CYAN,cap:true}); } }
+
+/* 1 · second-person verdicts — every line names a body part + a live number vs the ideal/population */
+function bodyFacts(){ const rn=frozen?capLip:(liveRing||capLip); if(!rn) return null;
+  const yp=ringPx(rn), ip=ringPx(meanTemplateFor(rn)); if(!yp||!ip) return null;
+  const you=lipMetrics(yp), id=lipMetrics(ip); if(!you||!id) return null;
+  const rel=(a,b)=> b? Math.round((a-b)/Math.abs(b)*100):0;                              // signed % difference vs the ideal
+  const lc=yp[you.li], rc=yp[you.ri], hM=Math.max(1,(you.H/120)*sizePx);                 // corner-height asymmetry, as % of feature height
+  const cornerDiff=Math.round(Math.abs(lc[1]-rc[1])/hM*100), leftLower=lc[1]>rc[1];
+  return { widthDev:rel(you.W,id.W), upperDev:rel(you.upV,id.upV), volumeDev:rel(you.area,id.area),
+    symIdx:Math.round(you.symIdx), cornerDiff, lowerSide:leftLower?'LEFT':'RIGHT', higherSide:leftLower?'RIGHT':'LEFT' }; }
+function partNoun(){ return curPart===PART.LIPS?'MOUTH':curPart.key; }
+function vfWidth(){ const f=bodyFacts(); if(!f) return null; const d=f.widthDev;
+  if(d>=1) return 'YOUR '+partNoun()+' IS '+d+'% WIDER THAN THE IDEAL. THIS COUNTS AGAINST YOU.';
+  if(d<=-1) return 'YOUR '+partNoun()+' IS '+(-d)+'% NARROWER THAN THE IDEAL.'; return null; }
+function vfUpper(){ if(curPart!==PART.LIPS) return null; const f=bodyFacts(); if(!f) return null; const d=f.upperDev;
+  if(d<=-1) return 'YOUR UPPER LIP IS '+(-d)+'% THINNER THAN THE IDEAL.';
+  if(d>=1) return 'YOUR UPPER LIP IS '+d+'% FULLER THAN THE IDEAL. THE IDEAL IS EXACT.'; return null; }
+function vfCorner(){ const f=bodyFacts(); if(!f||f.cornerDiff<2) return null;
+  return 'YOUR '+f.lowerSide+' CORNER SITS '+f.cornerDiff+'% LOWER THAN YOUR '+f.higherSide+'. THE IDEAL IS SYMMETRICAL.'; }
+function vfVol(){ const f=bodyFacts(); if(!f) return null;
+  if(f.symIdx>=70 && Math.abs(f.volumeDev)>=5) return 'YOUR SYMMETRY IS ACCEPTABLE. YOUR VOLUME IS NOT.'; return null; }
+function vfPop(){ return (100-Math.round(pctShown))+'% OF '+(curPart===PART.LIPS?'LIPS':curPart.key)+' IN YOUR REGION ARE CLOSER TO THE IDEAL THAN YOURS.'; }
+function vPick(){ const cs=arguments; return ()=>{ for(let i=0;i<cs.length;i++){ const s=cs[i](); if(s) return s; } return 'YOU RANK '+ord(pctShown)+'. THE IDEAL RANKS FIRST.'; }; }
+
+/* 2 · verbose analyst commentary — templates resolved once at line start, stable through the typewriter */
+const COMMENTARY={
+  [S.STANDBY]:[()=>'AESTHETIC STATISTICS. PLEASE PRESENT YOUR FACE FOR MEASUREMENT.'],
+  [S.FACE]:[()=>'I AM LOCATING YOUR FACE.', ()=>'I HAVE FOUND YOU. THANK YOU FOR HOLDING STILL.'],
+  [S.SELECT]:[()=>'CHOOSE A REGION TO BE MEASURED. OPEN YOUR MOUTH TO CONFIRM.', ()=>'ONLY THE LIPS MODULE IS FULLY LOADED IN THIS NODE. YOU MAY STILL SELECT ANOTHER.'],
+  [S.DISFACE]:[()=>'I AM SEPARATING YOUR FACE INTO MEASURABLE PARTS.', ()=>'TODAY I WILL MEASURE YOUR LIPS. THE OTHER PARTS WILL WAIT.'],
+  [S.ACQUIRE]:[()=>'I AM ACQUIRING YOUR LIPS. PLEASE ALIGN AND HOLD.'],
+  [S.CAPTURE]:[()=>'YOUR SAMPLE HAS BEEN RECORDED AS SAMPLE '+fmt(sessionSampleNo)+'.'],
+  [S.COMPARE]:[()=>'I AM RETRIEVING THE PERFECT LIPS.', ()=>'THESE ARE THE PERFECT LIPS OF 2026. THIS IS YOU.'],
+  [S.MEASURE]:[ vPick(vfWidth,vfUpper,vfPop), ()=>'I AM COMPARING YOU AGAINST '+fmt(regionalSamples)+' LIPS IN YOUR REGION.', vPick(vfCorner,vfVol,vfUpper) ],
+  [S.EXCHANGE]:[ vPick(vfUpper,vfWidth,vfCorner), ()=>'PLEASE HOLD STILL. PRECISION BENEFITS YOU.', vPick(vfPop,vfVol), vPick(vfCorner,vfWidth,vfUpper) ],
+  [S.GRADING]:[ ()=>'YOU ARE IN THE '+ord(pctShown)+' PERCENTILE.', vPick(vfPop,vfUpper,vfWidth),
+    (lastPct!=null? ()=>'THE PREVIOUS SAMPLE RANKED '+ord(lastPct)+'. YOU RANK '+ord(pctShown)+'.' : vPick(vfVol,vfCorner,vfUpper)) ],
+  [S.STRESS]:[()=>'I AM TESTING THE ELASTICITY OF YOUR SAMPLE.'],
+  [S.DISASSEMBLE]:[()=>'I AM DIVIDING YOUR LIPS INTO SIX MEASURABLE REGIONS.'],
+  [S.DELTA]:[ vPick(vfUpper,vfWidth,vfCorner), ()=>'I HAVE MARKED EVERY POINT THAT MUST MOVE.', vPick(vfPop) ],
+  [S.NOSE]:[()=>'WHILE YOU ARE HERE: PRELIMINARY NASAL SAMPLE ACQUIRED.', ()=>'NASAL IDEAL 2026 NOT YET LOADED IN THIS NODE. YOUR SAMPLE HAS BEEN FILED.'],
+  [S.IDEAL_ALONE]:[()=>'THIS IS THE IDEAL. IT IS THE MEAN OF ALL. IT BELONGS TO NO ONE.'],
+  [S.ASSEMBLE]:[()=>'I AM CORRECTING YOUR SAMPLE TOWARD THE IDEAL.', ()=>'PLEASE HOLD STILL. PRECISION BENEFITS YOU.'],
+  [S.ABSORB]:[()=>'CORRECTION COMPLETE. YOU NOW MATCH THE IDEAL.'],
+  [S.ARCHIVE]:[()=>'YOUR CORRECTED SAMPLE HAS BEEN FILED WITH THE OTHERS.'],
+  [S.ABSENCE]:[()=>'YOUR RECORD REMAINS OPEN. YOU ARE ENROLLED AND AWAITING CORRECTION.'],
+};
+let comCur='', comStart=-9, comPrev='', comPrevStart=-9, comKey='';
+function drawCommentary(){ const lines=COMMENTARY[state]||[]; const y=sizePx-INSET()*0.7;   // the machine's VOICE — primary, readable
+  if(lines.length){ const idx=Math.min(lines.length-1, Math.floor((st/(DUR[state]||6))*lines.length));
+    const dirTag=(MEASURE_STATES.has(state)&&curDir)?(curDir.part+curDir.dir):'';
+    const key=state+':'+idx+':'+dirTag;
+    if(key!==comKey){ comPrev=comCur; comPrevStart=T; comCur=lines[idx](); comStart=T; comKey=key; } }
+  const fa=clamp(1-(T-comPrevStart)/0.5,0,1);
+  if(fa>0&&comPrev) ctext(comPrev, INSET(), y-22, {size:11,col:CY+(0.22*fa).toFixed(2)+')',track:0.5});
+  const shown=comCur.slice(0, Math.floor((T-comStart)/0.03)), typing=shown.length<comCur.length;
+  ctext(shown+(typing&&((T*2|0)%2)?'_':''), INSET(), y, {size:15,col:CYAN,track:0.5}); }   // BODY, bright — the voice
+
+/* 5 · the final report — every number traces to a live measurement */
+function drawCapMouth(x,y,w,h){ xc.save(); xc.beginPath(); xc.rect(x,y,w,h); xc.clip();
+  if(hasCrop){ const a=cropAspect, z=1.32;                                             // zoom past the crop padding so the LIPS fill the tile (like the sample cutouts)
+    let dw=w*z,dh=w*z/a; if(dh<h*z){dh=h*z;dw=h*z*a;}
+    xc.filter='contrast(1.14) saturate(1.3)';                                          // grade the raw webcam crop so YOU reads as punchy as the curated samples, not washed
+    xc.drawImage(cropCv, x+(w-dw)/2, y+(h-dh)/2, dw, dh); xc.filter='none'; }
+  else { xc.fillStyle='rgba(0,22,20,0.6)'; xc.fillRect(x,y,w,h); } xc.restore();
+  xc.strokeStyle=CY+'0.4)'; xc.lineWidth=1; xc.strokeRect(x+0.5,y+0.5,w-1,h-1); }
+const REGION_NAME={ 'UPPER EDGE':'UPPER LIP', 'LOWER EDGE':'LOWER LIP', 'LEFT EDGE':'LEFT CORNER', 'RIGHT EDGE':'RIGHT CORNER' };
+function buildReport(){
+  const my=lipMetrics(ringPx(capLip)), id=lipMetrics(ringPx(meanTemplateFor(capLip)));
+  // every row is REAL: your measured value vs the value the ideal template has, same units, deviation + a plain reading
+  const rows=(my&&id)?curPart.rows.map(([label,key,unit])=>{ const you=my[key], ideal=id[key];
+    const dev=ideal?Math.abs(you-ideal)/Math.abs(ideal)*100:0, rel=ideal?(you-ideal)/Math.abs(ideal)*100:0;
+    return {label,you,ideal,unit,dev, read: dev<3?'WITHIN RANGE':(rel>0?'ABOVE IDEAL':'BELOW IDEAL')}; }):[];
+  const lr=ringPx(capLip), ir=ringPx(meanTemplateFor(capLip)), R=mouthRect(), lc=lr?ringCentroid(lr):[0,0];
+  // conclusions: the LARGEST real gap per region (deduped), worst-first — each names the region, the real %, and the real direction toward the ideal
+  const byReg={};
+  if(lr&&ir) for(let i=0;i<lr.length;i++){ const dx=ir[i][0]-lr[i][0], dy=ir[i][1]-lr[i][1], mag=Math.hypot(dx,dy);
+    if(mag<=R.h*0.03) continue; const reg=edgeLabel(lr[i],lc); if(!byReg[reg]||mag>byReg[reg].mag) byReg[reg]={dx,dy,mag}; }
+  const scripts=Object.entries(byReg).sort((a,b)=>b[1].mag-a[1].mag).slice(0,3).map(([reg,o])=>{
+    const vert=Math.abs(o.dy)>=Math.abs(o.dx), pv=Math.abs(100*(vert?o.dy/R.h:o.dx/R.w));
+    const dir = vert ? (o.dy<0?'RAISE':'LOWER') : (reg==='RIGHT EDGE' ? (o.dx>0?'WIDEN':'NARROW') : (o.dx<0?'WIDEN':'NARROW'));
+    const name = curPart===PART.LIPS ? (REGION_NAME[reg]||reg) : reg;
+    return dir+' YOUR '+name+' BY '+(pv<1?pv.toFixed(1):Math.round(pv))+'% TO REACH THE IDEAL.'; });
+  return { t:new Date(), no:sessionSampleNo, part:curPart.key, pct:Math.round(pctShown), pop:regionalSamples, rows, scripts,
+    cls:(verdict?verdict.cls:classifyDev(devShown)), dev:+devShown.toFixed(1), prev:lastPct }; }
+function drawReport(k){ if(!report) report=buildReport();
+  const S=sizePx, ins=INSET(), x=ins+S*0.011, W=S-2*(ins+S*0.011);              // ALL layout proportional to the square → fits any size, no footer collision
+  const LB=Math.round(S*0.0122), BODY=Math.round(S*0.0167), TITLE=Math.round(S*0.0244);
+  const rule=yy=>{ xc.save(); xc.strokeStyle=CY+'0.2)'; xc.lineWidth=1; xc.beginPath(); xc.moveTo(x,yy); xc.lineTo(x+W,yy); xc.stroke(); xc.restore(); };
+  const MI=Math.round(S*0.0104);                                                 // micro (legends)
+  let y=ins+S*0.024;
+  ctext('AESTHETIC STATISTICS · INDIVIDUAL REPORT', x, y, {size:Math.round(S*0.021),col:WHITE,cap:true,track:1});
+  ctext(report.t.toLocaleString('en-GB'), x+W, y, {size:LB,col:CY+'0.5)',align:'right',track:1}); y+=S*0.024;
+  ctext('SAMPLE Nº '+fmt(report.no), x, y, {size:LB,col:CY+'0.7)',track:1.5}); ctext('CLASSIFICATION · '+report.cls, x+W/2, y, {size:LB,col:CYAN,align:'center',cap:true,track:1.5}); ctext('REGION · '+report.part, x+W, y, {size:LB,col:CY+'0.7)',align:'right',track:1.5}); y+=S*0.020;
+  ctext('WHAT WE CHECKED — EVERY FEATURE OF YOUR '+report.part+' MEASURED AGAINST THE 2026 IDEAL. HOW FAR YOU SIT FROM IT IS YOUR DEVIATION.', x, y, {size:MI,col:CY+'0.5)',cap:true,track:0.5}); y+=S*0.012; rule(y); y+=S*0.040;
+  const iw=S*0.21, ih=iw*0.60; ctext('YOU', x, y-S*0.011, {size:LB,col:CYAN,cap:true,track:2}); drawCapMouth(x,y,iw,ih);
+  const ix=x+W-iw; ctext('IDEAL '+report.part+' · 2026', ix, y-S*0.011, {size:LB,col:CYAN,cap:true,track:2}); drawPartIdeal({x:ix,y:y,w:iw,h:ih}, 0.95, false);
+  y+=ih+S*0.040; rule(y); y+=S*0.028;
+  const cY=x+W*0.44, cI=x+W*0.60, cD=x+W*0.74;                                   // column anchors: YOU · IDEAL · DEVIATION · READING(right)
+  ctext('PARAMETER', x, y, {size:MI,col:CY+'0.45)',track:1.5}); ctext('YOU', cY, y, {size:MI,col:CY+'0.45)',align:'right',track:1});
+  ctext('IDEAL', cI, y, {size:MI,col:CY+'0.45)',align:'right',track:1}); ctext('DEVIATION', cD, y, {size:MI,col:CY+'0.45)',align:'right',track:1}); ctext('READING', x+W, y, {size:MI,col:CY+'0.45)',align:'right',track:1}); y+=S*0.012; rule(y); y+=S*0.030;
+  for(const r of report.rows){ ctext(r.label, x, y, {size:BODY,col:CY+'0.75)',track:0.5});
+    ctext(r.you.toFixed(1)+r.unit, cY, y, {size:BODY,col:CYAN,align:'right'});
+    ctext(r.ideal.toFixed(1)+r.unit, cI, y, {size:BODY,col:CY+'0.55)',align:'right'});
+    ctext(r.dev.toFixed(1)+'%', cD, y, {size:BODY,col:CYAN,align:'right'});
+    ctext(r.read, x+W, y, {size:MI,col:(r.read==='WITHIN RANGE'?CY+'0.55)':MG+'0.9)'),align:'right',cap:true,track:0.5}); y+=S*0.030; }
+  y+=S*0.012; rule(y); y+=S*0.044;
+  ctext('YOU RANKED IN THE '+ord(report.pct)+' PERCENTILE', x, y, {size:TITLE,col:CYAN,cap:true,track:2});
+  ctext('CLASSIFICATION · '+report.cls, x+W, y, {size:LB,col:CYAN,align:'right',cap:true,track:1.5}); y+=S*0.024;
+  ctext('YOU ARE CLOSER TO THE IDEAL THAN '+(100-report.pct)+'% OF '+fmt(report.pop)+' REGIONAL SAMPLES.', x, y, {size:LB,col:CY+'0.6)',cap:true,track:0.5}); y+=S*0.022;
+  if(report.prev!=null){ ctext('THE PREVIOUS VISITOR RANKED '+ord(report.prev)+'.  YOU RANK '+ord(report.pct)+'.', x, y, {size:MI,col:CY+'0.55)',cap:true,track:0.5}); y+=S*0.018; }
+  ctext('BANDS · <10% NEAR-IDEAL · <25% ACCEPTABLE · <45% SUBSTANDARD · ≥45% CORRECTION URGENT', x, y, {size:MI,col:CY+'0.4)',cap:true,track:0.5}); y+=S*0.034;
+  ctext('PRESCRIBED CORRECTIONS — THE REAL MOVES THAT CLOSE YOUR LARGEST GAPS', x, y, {size:MI,col:CY+'0.5)',cap:true,track:1}); y+=S*0.028;
+  if(report.scripts.length) for(const s of report.scripts){ ctext('·  '+s, x, y, {size:BODY,col:CY+'0.85)',track:0.5}); y+=S*0.028; }
+  else { ctext('·  NONE OUTSTANDING. YOU ALREADY MATCH THE IDEAL WITHIN TOLERANCE.', x, y, {size:BODY,col:CY+'0.85)',track:0.5}); }
+  const fy=S-ins-S*0.016; rule(fy-S*0.022);
+  ctext('RE-EXAMINATION SCHEDULED · 14 DAYS · '+report.cls+' · STATUS: ENROLLED · AWAITING CORRECTION', x, fy, {size:LB,col:CY+'0.6)',cap:true,track:1.5}); }
+
+/* bokeh — dark, subtle, receding lip field behind the hero (its own #bg canvas, z1).
+   Each cutout is feathered + blurred into a cache ONCE, so per-frame cost is just cheap drawImages. */
+const BOKEH_ON=new Set([S.MEASURE,S.EXCHANGE,S.GRADING,S.STRESS,S.DISASSEMBLE,S.DELTA,S.IDEAL_ALONE,S.ASSEMBLE,S.ABSORB,S.ARCHIVE,S.ABSENCE]);
+const BOKEH=Array.from({length:12},(_,i)=>({img:i%NLIP, x:rnd(i*1.7+0.3), y:rnd(i*2.3+0.9), r:0.10+rnd(i*3.1)*0.09, ph:rnd(i*4.7)*6.28, sp:0.015+rnd(i*5.3)*0.02}));
+const bokehCache=[]; let bokehI=0;
+function buildBokehTile(idx){ const img=lipImgs[idx]; if(!img) return null; const S=256, c=document.createElement('canvas'); c.width=c.height=S; const g=c.getContext('2d');
+  const a=img.naturalWidth/img.naturalHeight; let dw=S,dh=S/a; if(dh>S){dh=S;dw=S*a;}
+  g.filter='blur(6px)'; g.drawImage(img,(S-dw)/2,(S-dh)/2,dw,dh); g.filter='none';
+  g.globalCompositeOperation='destination-in'; const rg=g.createRadialGradient(S/2,S/2,S*0.10,S/2,S/2,S*0.5); rg.addColorStop(0,'#000'); rg.addColorStop(0.5,'#000'); rg.addColorStop(1,'rgba(0,0,0,0)'); g.fillStyle=rg; g.fillRect(0,0,S,S); return c; }
+function drawBokeh(){ bgc.clearRect(0,0,sizePx,sizePx); bokehI=lerp(bokehI, BOKEH_ON.has(state)?1:0, 0.05); if(bokehI<0.02) return;
+  const reduce=(window.matchMedia&&matchMedia('(prefers-reduced-motion: reduce)').matches), t=reduce?0:T;
+  for(const b of BOKEH){ if(bokehCache[b.img]===undefined) bokehCache[b.img]=buildBokehTile(b.img); const tile=bokehCache[b.img]; if(!tile) continue;
+    const dx=Math.sin(t*b.sp+b.ph)*sizePx*0.018, dy=Math.cos(t*b.sp*0.8+b.ph)*sizePx*0.018, rad=b.r*sizePx;
+    bgc.save(); bgc.globalAlpha=0.16*bokehI; bgc.drawImage(tile, (0.1+b.x*0.8)*sizePx+dx-rad, (0.12+b.y*0.76)*sizePx+dy-rad, rad*2, rad*2); bgc.restore(); }
+  bgc.save(); bgc.globalCompositeOperation='multiply'; bgc.fillStyle='rgba(26,8,12,1)'; bgc.fillRect(0,0,sizePx,sizePx); bgc.restore(); }
+
+const hud=document.getElementById('umhud');
+function drawHud(){ if(!DEBUG){ hud.textContent=''; return; }
+  hud.textContent='['+NAME[state]+' '+st.toFixed(1)+'s] cam:'+(camOK?'OK':'NO')+' faces:'+faceCount+' mesh:'+(faceEdges?faceEdges.length:0)+' cap:'+capAmt.toFixed(2)+' str:'+stretch.toFixed(2)+' chill:'+chill.toFixed(2)+' dev:'+devShown.toFixed(1)+' mean(n='+meanN+')'+(SWAP?(' swap:'+swapState+'('+swapMouths.length+')'):''); }
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

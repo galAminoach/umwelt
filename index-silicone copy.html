@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>UMWELT — silicone</title>
+<style>
+  @font-face{ font-family:'PP Fraktion Mono'; src:url('fonts/PPFraktionMono-Regular.otf') format('opentype'); font-weight:400; font-display:swap; }
+  @font-face{ font-family:'PP Fraktion Mono'; src:url('fonts/PPFraktionMono-Bold.otf') format('opentype'); font-weight:700; font-display:swap; }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;background:#000;overflow:hidden}
+  body{ display:flex;align-items:center;justify-content:center;
+    background:radial-gradient(120% 120% at 50% 50%, #0c0307 0%, #03010200 55%, #000 100%), #000; }
+  .stage{ position:relative; width:min(94vmin,900px); height:min(94vmin,900px); border-radius:2px; overflow:hidden; background:#050103;
+    box-shadow:0 0 0 1px rgba(255,180,190,0.05), 0 0 60px 8px rgba(120,10,30,0.18), inset 0 0 140px 12px rgba(0,0,0,0.9); }
+  canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+  #gl{z-index:2} #fx{z-index:3}
+  .glass{ position:absolute;inset:0;z-index:4;pointer-events:none;
+    background:radial-gradient(135% 135% at 50% 46%, rgba(0,0,0,0) 60%, rgba(0,0,0,0.5) 100%); mix-blend-mode:multiply; }
+  #umhud{position:absolute;top:6px;left:8px;z-index:6;font:11px 'PP Fraktion Mono',monospace;color:#f0a8b6;text-shadow:0 0 4px #000;white-space:pre;pointer-events:none}
+  video{position:absolute;width:2px;height:2px;opacity:0;pointer-events:none;left:-10px;top:-10px}
+</style>
+</head>
+<body>
+  <div class="stage" id="stage">
+    <canvas id="gl"></canvas>
+    <canvas id="fx"></canvas>
+    <div class="glass"></div>
+    <div id="umhud"></div>
+    <video id="vid" playsinline muted></video>
+  </div>
+
+<script type="module">
+import { FaceLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const cv=document.getElementById('gl');
+const gl=cv.getContext('webgl2',{alpha:false});
+const fxc=document.getElementById('fx'); const xc=fxc.getContext('2d');
+const vid=document.getElementById('vid');
+if(!gl) throw new Error('no webgl2');
+const clamp=(x,a,b)=>Math.max(a,Math.min(b,x)), lerp=(a,b,t)=>a+(b-a)*t;
+const smoothstep=(a,b,x)=>{const t=clamp((x-a)/(b-a),0,1);return t*t*(3-2*t);};
+const DEBUG=location.search.includes('debug');
+const INK='rgba(240,215,223,';
+
+/* ===== the isolated mouth — HALF MINE / HALF SILICONE, wet living tissue. ===== */
+/* A wandering wet seam splits the mouth: my flesh on one side, a poreless idealized
+   silicone prosthetic on the other. Capture fixes it as a specimen; ASSEMBLE lets the
+   silicone conquer; it never fully returns below half. Mucous surface everywhere. */
+const VERT=`#version 300 es
+in vec2 c; out vec2 uv; void main(){ uv=c*0.5+0.5; gl_Position=vec4(c,0.,1.); }`;
+const FRAG=`#version 300 es
+precision highp float; in vec2 uv; out vec4 O;
+uniform sampler2D uMouth; uniform float uTime,uHasCrop,uDistort,uAspect,uCapture,uInflate,uSilicon;
+float hash(vec2 p){ p=fract(p*vec2(123.34,456.21)); p+=dot(p,p+45.32); return fract(p.x*p.y); }
+float vnoise(vec2 p){ vec2 i=floor(p),f=fract(p); f=f*f*(3.-2.*f);
+  float a=hash(i),b=hash(i+vec2(1,0)),c=hash(i+vec2(0,1)),d=hash(i+vec2(1,1));
+  return mix(mix(a,b,f.x),mix(c,d,f.x),f.y); }
+float fbm(vec2 p){ float s=0.,a=.5; for(int i=0;i<4;i++){ s+=a*vnoise(p); p*=2.04; a*=.5;} return s; }
+vec3 wet(vec3 col){ col=pow(max(col,0.),vec3(1.06)); vec3 wine=vec3(0.5,0.07,0.17); return mix(col, col*wine*2.6, 0.16); }
+void main(){
+  vec2 p=uv;
+  vec2 box=vec2(0.42, 0.42/max(uAspect,1.0));
+  vec2 d=(p-vec2(0.5,0.5))/box;
+  float t=uTime; float cap=clamp(uCapture,0.0,1.0);
+  vec2 flow=vec2(fbm(d*3.2+t*0.45), fbm(d*3.2 - t*0.38+7.0))-0.5;
+  vec2 wob=vec2(sin(t*0.9+d.y*7.0), cos(t*0.75+d.x*7.0));
+  float infl=1.0 + 0.10*uDistort*sin(t*0.6);
+  vec2 dd=d*infl + (flow*1.3+wob*0.45)*uDistort;
+  vec2 cuv=clamp(dd*0.5+0.5,0.0,1.0);
+  cuv = clamp(0.5 + (cuv-0.5)/(1.0+uInflate*vec2(0.34,0.82)), 0.0, 1.0);   // ASSEMBLE: silicone plumps fuller
+
+  /* --- the wandering wet seam: mine (left) | silicone (right) --- */
+  float seamN=(fbm(vec2(dd.y*2.4+t*0.10, t*0.13))-0.5)*0.55;               // seam slithers wetly
+  float thr = mix(1.15, -1.15, clamp(uSilicon,0.0,1.0)) + seamN;           // uSilicon = how far silicone has spread
+  float sil = smoothstep(thr-0.10, thr+0.10, dd.x);
+  float seamGlow = exp(-pow((dd.x-thr)/0.05,2.0));                          // glistening mucous at the join
+
+  vec3 c0=texture(uMouth,cuv).rgb;
+  if(cap>0.001){                                                           // capture = de-blur into a fixed specimen
+    vec2 e=1.6/vec2(textureSize(uMouth,0));
+    vec3 bl=(texture(uMouth,cuv+vec2(e.x,0.0)).rgb+texture(uMouth,cuv-vec2(e.x,0.0)).rgb
+            +texture(uMouth,cuv+vec2(0.0,e.y)).rgb+texture(uMouth,cuv-vec2(0.0,e.y)).rgb)*0.25;
+    c0=mix(c0, c0+(c0-bl)*2.4, cap);
+    c0=mix(c0, (c0-0.5)*1.30+0.5, cap*0.85);
+  }
+  vec3 mine = mix(wet(c0), c0, cap*0.5);                                    // my side: real wet flesh
+
+  /* --- silicone: poreless (blurred), idealized, glossy, subsurface translucency --- */
+  vec2 e3=3.0/vec2(textureSize(uMouth,0));
+  vec3 blur=(c0
+    +texture(uMouth,cuv+vec2(e3.x,0.0)).rgb+texture(uMouth,cuv-vec2(e3.x,0.0)).rgb
+    +texture(uMouth,cuv+vec2(0.0,e3.y)).rgb+texture(uMouth,cuv-vec2(0.0,e3.y)).rgb
+    +texture(uMouth,cuv+e3).rgb+texture(uMouth,cuv-e3).rgb)/7.0;
+  float lum=dot(blur,vec3(0.299,0.587,0.114));
+  vec3 silicone=mix(vec3(lum), vec3(0.80,0.44,0.50), 0.60);                 // pale fleshy-silicone, wine-tinged (not sterile)
+  silicone += vec3(0.34,0.05,0.12)*pow(max(0.0,1.0-length(d*vec2(0.7,1.0))),2.0)*0.55;  // subsurface inner bleed
+  vec2 lp=vec2(0.26*sin(t*0.5), -0.30);
+  float spec=pow(max(0.0,1.0-length(d-lp)*1.25),16.0);
+  silicone += spec*vec3(1.0,0.93,0.96)*0.85;                               // hard synthetic gloss
+
+  vec3 flesh = mix(mine, silicone, sil);
+  flesh += seamGlow*vec3(1.0,0.86,0.90)*0.5;                               // wet mucous seam highlight
+
+  float sheen=pow(max(0.0,1.0-length(d*vec2(0.8,1.2))),3.0);              // soft natural sheen, my side only
+  flesh += sheen*vec3(1.0,0.9,0.94)*0.22*(1.0-sil)*(1.0-cap*0.5);
+
+  /* --- membrane mask --- */
+  vec2 dM=d/(1.0+uInflate*vec2(0.30,0.66));
+  float r=length(dM*vec2(0.80,1.0));
+  r += (fbm(uv*3.4+t*0.22)-0.5)*0.24*(1.0-cap);
+  float lo=mix(0.26,0.66,cap), hi=mix(1.04,1.02,cap);
+  float mask=smoothstep(hi,lo,r);
+
+  /* --- damp breathing tissue ground (never sterile black) --- */
+  float bg=fbm(p*3.0+t*0.06);
+  vec3 ground=mix(vec3(0.02,0.006,0.014), vec3(0.07,0.012,0.035), bg);
+
+  vec3 col=mix(ground, flesh, mask);
+
+  /* --- mucous film across the whole surface --- */
+  float film=fbm(p*6.0+vec2(t*0.10,-t*0.08));
+  col += pow(film,3.0)*vec3(0.5,0.3,0.36)*0.12;
+
+  float vig=smoothstep(1.5,0.4,length((p-0.5)*2.0)); col*=0.5+0.5*vig;
+  col+=(hash(p*vec2(900.0)+t)-0.5)*0.012*(1.0-cap);
+  O=vec4(max(col,0.0),1.0);
+}`;
+function sh(ty,src){ const s=gl.createShader(ty); gl.shaderSource(s,src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+const prog=gl.createProgram(); gl.attachShader(prog,sh(gl.VERTEX_SHADER,VERT)); gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,FRAG));
+gl.linkProgram(prog); if(!gl.getProgramParameter(prog,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+const quad=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,quad);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+const cl=gl.getAttribLocation(prog,'c'); gl.enableVertexAttribArray(cl); gl.vertexAttribPointer(cl,2,gl.FLOAT,false,0,0);
+const U=(n)=>gl.getUniformLocation(prog,n);
+const u={ mouth:U('uMouth'),time:U('uTime'),hasCrop:U('uHasCrop'),distort:U('uDistort'),aspect:U('uAspect'),capture:U('uCapture'),inflate:U('uInflate'),silicon:U('uSilicon') };
+gl.uniform1i(u.mouth,0);
+const mouthTex=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,mouthTex);
+for(const pn of [gl.TEXTURE_WRAP_S,gl.TEXTURE_WRAP_T]) gl.texParameteri(gl.TEXTURE_2D,pn,gl.CLAMP_TO_EDGE);
+for(const pn of [gl.TEXTURE_MIN_FILTER,gl.TEXTURE_MAG_FILTER]) gl.texParameteri(gl.TEXTURE_2D,pn,gl.LINEAR);
+
+let DPR=Math.min(window.devicePixelRatio||1,1.5), sizePx=900;
+function resize(){ const r=cv.getBoundingClientRect(); sizePx=r.width||900;
+  cv.width=fxc.width=Math.round(sizePx*DPR); cv.height=fxc.height=Math.round(sizePx*DPR);
+  gl.viewport(0,0,cv.width,cv.height); xc.setTransform(DPR,0,0,DPR,0,0); }
+window.addEventListener('resize',resize); resize();
+
+/* mouth display rect on the 2D overlay (matches the shader's box mapping) */
+function mouthRect(){ const bx=0.42, by=0.42/Math.max(stillAspect,1.0);
+  return { x:(0.5-bx)*sizePx, y:(0.5-by)*sizePx, w:2*bx*sizePx, h:2*by*sizePx }; }
+
+/* ---------- crop the live video to the lips ---------- */
+const cropCv=document.createElement('canvas'); const cctx=cropCv.getContext('2d');
+let hasCrop=0, cropAspect=1.7, stillAspect=1.7;
+function updateCrop(){
+  if(frozen) return;
+  if(!camOK||vid.readyState<2||!vid.videoWidth) return;
+  const vw=vid.videoWidth,vh=vid.videoHeight; const sw=2*vidCrop.hx*vw, sh=2*vidCrop.hy*vh; if(sw<4||sh<4) return;
+  cropAspect=clamp(sw/sh,1.0,3.0); cropCv.width=640; cropCv.height=Math.max(2,Math.round(640/cropAspect));
+  cctx.save(); cctx.translate(cropCv.width,0); cctx.scale(-1,1);
+  try{ cctx.drawImage(vid,(vidCrop.cx-vidCrop.hx)*vw,(vidCrop.cy-vidCrop.hy)*vh,sw,sh,0,0,cropCv.width,cropCv.height); }catch(e){ cctx.restore(); return; }
+  cctx.restore();
+  gl.bindTexture(gl.TEXTURE_2D,mouthTex); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,cropCv); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false); hasCrop=1;
+}
+/* at capture: freeze the crop + store the lip outline (crop-normalised, top-down) */
+let capLip=null;
+function snapshotCapture(){
+  stillAspect=cropAspect;
+  if(lastLM){ const cx=vidCrop.cx,cy=vidCrop.cy,hx=vidCrop.hx,hy=vidCrop.hy;
+    capLip=LIPS.map(k=>{ const u=1-(lastLM[k].x-(cx-hx))/(2*hx); const v=(lastLM[k].y-(cy-hy))/(2*hy); return [clamp(u,0,1),clamp(v,0,1)]; }); }
+  count++; localStorage.setItem(COUNT_KEY,String(count));
+}
+
+/* ---------- MediaPipe ---------- */
+let liveLM=null, camOK=false, lastVT=-1, delegateUsed='-', faceCount=0, lastLM=null;
+const LIPS=[61,185,40,39,37,0,267,269,270,409,291,375,321,405,314,17,84,181,91,146];
+const vidCrop={cx:0.5,cy:0.62,hx:0.14,hy:0.10}; let presence=0, lastSeen=0;
+const COUNT_KEY='umwelt.silicone.count'; let count=parseInt(localStorage.getItem(COUNT_KEY)||'0',10); if(isNaN(count))count=0;
+function log(...a){ console.log('[umwelt]',...a); }
+async function makeLandmarker(d){ const fs=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  return FaceLandmarker.createFromOptions(fs,{baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",delegate:d},runningMode:"VIDEO",numFaces:1}); }
+async function goLive(){
+  if(location.search.includes('nocam')){ camOK=false; return; }
+  try{ liveLM=await makeLandmarker("GPU"); delegateUsed='GPU'; }catch(e){ try{ liveLM=await makeLandmarker("CPU"); delegateUsed='CPU'; }catch(e2){ liveLM=null; delegateUsed='FAIL'; log('LM FAIL',e2?.message); } }
+  try{
+    if(location.search.includes('demoface')){
+      const fimg=new Image(); fimg.src='faces/face1.jpg'; await fimg.decode();
+      const dc=document.createElement('canvas'); dc.width=dc.height=640; const dx=dc.getContext('2d');
+      const cs=Math.max(640/fimg.naturalWidth,640/fimg.naturalHeight);
+      (function dr(){ dx.fillStyle='#000'; dx.fillRect(0,0,640,640); dx.drawImage(fimg,(640-fimg.naturalWidth*cs)/2,(640-fimg.naturalHeight*cs)/2,fimg.naturalWidth*cs,fimg.naturalHeight*cs); requestAnimationFrame(dr); })();
+      vid.srcObject=dc.captureStream(30); await vid.play(); camOK=true;
+    }else{ const st=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:1280},height:{ideal:1280}},audio:false}); vid.srcObject=st; await vid.play(); camOK=true; }
+  }catch(e){ camOK=false; log('cam FAIL',e?.message); }
+}
+function readMouth(nowMs){
+  if(!liveLM||!camOK||vid.readyState<2) return; if(vid.currentTime===lastVT) return; lastVT=vid.currentTime;
+  let res; try{ res=liveLM.detectForVideo(vid,nowMs); }catch(e){ return; }
+  faceCount=(res&&res.faceLandmarks)?res.faceLandmarks.length:0;
+  if(faceCount){ const L=res.faceLandmarks[0]; lastLM=L; let mnx=1,mxx=0,mny=1,mxy=0;
+    for(const k of LIPS){ const x=L[k].x,y=L[k].y; if(x<mnx)mnx=x; if(x>mxx)mxx=x; if(y<mny)mny=y; if(y>mxy)mxy=y; }
+    const cx=(mnx+mxx)/2, cy=(mny+mxy)/2, hx=(mxx-mnx)/2*1.16, hy=(mxy-mny)/2*1.42;
+    if(!frozen){ vidCrop.cx=lerp(vidCrop.cx,cx,0.4); vidCrop.cy=lerp(vidCrop.cy,cy,0.4); vidCrop.hx=lerp(vidCrop.hx,Math.max(0.04,hx),0.3); vidCrop.hy=lerp(vidCrop.hy,Math.max(0.03,hy),0.3); }
+    lastSeen=performance.now();
+  }
+}
+goLive();
+
+/* ===========================  STATE MACHINE  =========================== */
+const S={MIRROR:0,DISTORT:1,CAPTURE:2,FLASH:3,MEASURE:4,DISASSEMBLE:5,DELTA:6,ASSEMBLE:7,ABSORB:8,SEA:9,RETURN:10};
+const NAME=Object.keys(S);
+const DUR={ [S.DISTORT]:6.5,[S.CAPTURE]:2.4,[S.FLASH]:1.2,[S.MEASURE]:3.6,[S.DISASSEMBLE]:3.6,[S.DELTA]:2.0,[S.ASSEMBLE]:9.0,[S.ABSORB]:3.0,[S.SEA]:5.0,[S.RETURN]:1.6 };
+const SIL_BASE=0.5;                                                 // the unsettling constant: already half silicone
+let state=S.MIRROR, st=0, distort=0.03, frozen=false, capAmt=0, inflate=0, silicon=SIL_BASE;
+function enter(ns){ state=ns; st=0;
+  if(ns===S.CAPTURE){ frozen=true; snapshotCapture(); }
+  if(ns===S.MIRROR){ frozen=false; }
+}
+function tickState(dt, now){
+  st+=dt;
+  const held = DEBUG && window.__holdState===state;
+  const seen=(now-lastSeen)<250; presence=lerp(presence, seen?1:0, 1-Math.exp(-(seen?5:1.5)*dt));
+  let tDistort=distort, tCap=capAmt, tInfl=inflate, tSil=silicon;
+  switch(state){
+    case S.MIRROR: tDistort=lerp(distort,0.03,1-Math.exp(-3*dt)); tCap=lerp(capAmt,0,1-Math.exp(-4*dt)); tInfl=0; tSil=lerp(silicon,SIL_BASE,1-Math.exp(-3*dt));
+      if(!held && presence>0.6 && st>2.5) enter(S.DISTORT); break;
+    case S.DISTORT: tDistort=lerp(0.03,0.22,smoothstep(0,1,st/DUR[state])); tCap=0; tInfl=0; tSil=SIL_BASE;
+      if(!held){ if(presence<0.25) enter(S.MIRROR); else if(st>=DUR[state]) enter(S.CAPTURE); } break;
+    case S.CAPTURE: tDistort=lerp(distort,0,1-Math.exp(-6*dt)); tCap=lerp(capAmt,1,1-Math.exp(-3.5*dt)); tInfl=0; tSil=SIL_BASE;
+      if(!held && st>=DUR[state]) enter(S.FLASH); break;
+    case S.FLASH: tDistort=0; tCap=1; tInfl=0;                                                  // silicone flickers, possessing then receding
+      tSil=SIL_BASE + 0.45*(rnd(Math.floor(T*16)*1.7)>0.5?1:0);
+      if(!held && st>=DUR[state]) enter(S.MEASURE); break;
+    case S.MEASURE: tDistort=0; tCap=1; tInfl=0; tSil=SIL_BASE; if(!held && st>=DUR[state]) enter(S.DISASSEMBLE); break;
+    case S.DISASSEMBLE: tDistort=0; tCap=1; tInfl=0; tSil=SIL_BASE; if(!held && st>=DUR[state]) enter(S.DELTA); break;
+    case S.DELTA: tDistort=0; tCap=1; tInfl=0; tSil=SIL_BASE; if(!held && st>=DUR[state]) enter(S.ASSEMBLE); break;
+    case S.ASSEMBLE: tDistort=0; tCap=1;                                                        // the silicone conquers — slow & linear
+      tInfl=clamp(st/DUR[state],0,1); tSil=lerp(SIL_BASE,0.92,clamp(st/DUR[state],0,1));
+      if(!held && st>=DUR[state]) enter(S.ABSORB); break;
+    case S.ABSORB: tDistort=0; tCap=1; tInfl=1.0-0.05*smoothstep(0,1,st/DUR[state]); tSil=0.90;  // hold the filled silicone, faint settle
+      if(!held && st>=DUR[state]) enter(S.SEA); break;
+    case S.SEA: tDistort=0; tCap=1; tInfl=1.0; tSil=0.90; if(!held && st>=DUR[state]) enter(S.RETURN); break;
+    case S.RETURN: tDistort=0; tCap=lerp(capAmt,0,1-Math.exp(-3*dt)); tInfl=0; tSil=lerp(silicon,SIL_BASE,1-Math.exp(-3*dt)); // never below half
+      if(!held && st>=DUR[state]) enter(S.MIRROR); break;
+  }
+  distort=tDistort; capAmt=tCap; inflate=tInfl; silicon=tSil;
+}
+
+/* ===========================  RENDER  =========================== */
+const showMouth=()=> state!==S.DISASSEMBLE && state!==S.SEA && state!==S.RETURN;
+let prevT=performance.now()*0.001, startT=prevT, T=0;
+function frame(){
+  const now=performance.now(), t=now*0.001; let dt=t-prevT; prevT=t; if(dt>0.05)dt=0.05; T=t-startT;
+  readMouth(now); updateCrop(); tickState(dt, now);
+
+  gl.clearColor(0.02,0.006,0.014,1.0); gl.clear(gl.COLOR_BUFFER_BIT);
+  if(showMouth()){
+    gl.uniform1f(u.time,T); gl.uniform1f(u.hasCrop,hasCrop); gl.uniform1f(u.distort,distort);
+    gl.uniform1f(u.aspect,frozen?stillAspect:cropAspect); gl.uniform1f(u.capture,capAmt); gl.uniform1f(u.inflate,inflate); gl.uniform1f(u.silicon,silicon);
+    gl.drawArrays(gl.TRIANGLES,0,3);
+  }
+  // 2D overlay journey
+  xc.clearRect(0,0,sizePx,sizePx);
+  const k=DUR[state]?clamp(st/DUR[state],0,1):0;
+  if(state===S.FLASH) drawFlash(st);
+  else if(state===S.MEASURE) drawMeasure(k);
+  else if(state===S.DISASSEMBLE) drawDisassemble(k);
+  else if(state===S.DELTA) drawDelta(k);
+  else if(state===S.ASSEMBLE) drawAssembleOutline(k);
+  else if(state===S.SEA) drawSea(1, k);
+  else if(state===S.RETURN) drawSea(1, 1);
+  if(state>=S.CAPTURE && state<=S.ABSORB){ xc.save(); xc.fillStyle='rgba(110,25,45,0.09)'; xc.fillRect(0,0,sizePx,sizePx); xc.restore(); }   // wet wine veil
+  drawHud();
+  requestAnimationFrame(frame);
+}
+
+/* --- overlay helpers --- */
+const rnd=(s)=>{ const x=Math.sin(s*127.1)*43758.5453; return x-Math.floor(x); };
+function lipPx(){ const R=mouthRect(); return capLip? capLip.map(([u,v])=>[R.x+u*R.w, R.y+v*R.h]) : null; }
+function strokeOutline(P,style,w,dash){ xc.save(); if(dash)xc.setLineDash(dash); xc.strokeStyle=style; xc.lineWidth=w;
+  xc.beginPath(); P.forEach((p,i)=> i?xc.lineTo(p[0],p[1]):xc.moveTo(p[0],p[1])); xc.closePath(); xc.stroke(); xc.restore(); }
+function templateLip(){ if(!capLip) return null; let cx=0,cy=0; capLip.forEach(([u,v])=>{cx+=u;cy+=v;}); cx/=capLip.length; cy/=capLip.length;
+  return capLip.map(([u,v])=>[cx+(u-cx)*1.16, cy+(v-cy)*1.42]); }
+function tplPx(){ const R=mouthRect(),T2=templateLip(); return T2?T2.map(([u,v])=>[R.x+u*R.w,R.y+v*R.h]):null; }
+function pad3(n){ return String(n).padStart(3,'0'); }
+const CY='rgb(255,150,158)', MG='rgba(165,28,52,';           // fleshy pink + wine-red
+const gstep=()=>Math.floor(T*18);
+const gj=(s,amp)=>(rnd(s*1.7+gstep())-0.5)*2*(amp||1);
+function cross(p,r){ xc.beginPath(); xc.moveTo(p[0]-r,p[1]); xc.lineTo(p[0]+r,p[1]); xc.moveTo(p[0],p[1]-r); xc.lineTo(p[0],p[1]+r); xc.stroke(); }
+function arrow(a,b){ xc.beginPath(); xc.moveTo(a[0],a[1]); xc.lineTo(b[0],b[1]); const an=Math.atan2(b[1]-a[1],b[0]-a[0]);
+  xc.moveTo(b[0],b[1]); xc.lineTo(b[0]-6*Math.cos(an-0.4),b[1]-6*Math.sin(an-0.4)); xc.moveTo(b[0],b[1]); xc.lineTo(b[0]-6*Math.cos(an+0.4),b[1]-6*Math.sin(an+0.4)); xc.stroke(); }
+const MM=(a,b)=>(Math.hypot(a[0]-b[0],a[1]-b[1])/sizePx*120);
+
+function drawFlash(stt){                                      // abstract possession — wet wine tear-bands, no foreign mouths
+  const R=mouthRect(), g=Math.floor(stt/0.06);
+  xc.save();
+  for(let i=0;i<5;i++){ const y=R.y-10+rnd(g*7+i)*(R.h+20); const h=2+rnd(g+i)*7;
+    xc.fillStyle='rgba(190,40,70,'+(0.08+rnd(g+i*3)*0.16)+')'; xc.fillRect(R.x-12, y, R.w+24, h); }
+  xc.restore();
+}
+function drawMeasure(k){                                      // abstract topographic tissue mapping (sparse numbers)
+  const P=lipPx(); if(!P) return; const R=mouthRect(), g=gstep();
+  let cx=0,cy=0; P.forEach(([x,y])=>{cx+=x;cy+=y;}); cx/=P.length; cy/=P.length;
+  xc.save();
+  for(let r=0;r<6;r++){ const sc=1.0+r*0.17*(1+0.04*Math.sin(T*0.5+r)), js=gj(r,2.2);   // iso-contours radiating out
+    const rev=smoothstep(r/6, r/6+0.5, k);
+    strokeOutline(P.map(([x,y])=>[cx+(x-cx)*sc+js, cy+(y-cy)*sc]), MG+(0.06+0.22*rev*(1-r*0.12))+')', 1, [4,5]); }
+  const n=Math.max(2,Math.min(P.length,Math.floor(k*P.length*2)+2));                   // the live contour, stepped
+  xc.strokeStyle=CY; xc.lineWidth=1.4; xc.beginPath(); for(let i=0;i<n;i++){ const p=P[i%P.length]; i?xc.lineTo(p[0],p[1]):xc.moveTo(p[0],p[1]); } xc.stroke();
+  const sy=R.y+((T*0.5)%1)*R.h; xc.strokeStyle='rgba(220,90,110,0.45)'; xc.lineWidth=1.2; // wet slow scan
+  xc.beginPath(); xc.moveTo(R.x-12,sy); xc.lineTo(R.x+R.w+12,sy); xc.stroke();
+  const Lc=P[0],Rc=P[10],Tp=P[5],Bp=P[15];                                             // a couple of soft readouts only
+  xc.fillStyle=INK+'0.9)'; xc.font="700 11px 'PP Fraktion Mono',monospace";
+  xc.fillText('W '+MM(Lc,Rc).toFixed(1)+'mm', R.x, R.y-10);
+  xc.fillStyle=MG+'0.95)'; xc.font="9px 'PP Fraktion Mono',monospace";
+  xc.fillText('SILICONE '+((silicon*100)|0)+'%', R.x+R.w-92, R.y-10);
+  xc.fillText('SPEC №'+pad3(count), R.x, R.y+R.h+16);
+  xc.restore();
+}
+const PARTS=[
+  {sx:0.15,sy:0.06,sw:0.70,sh:0.42, dx:0,dy:-1, tag:'UPPER'},
+  {sx:0.15,sy:0.50,sw:0.70,sh:0.44, dx:0,dy:1,  tag:'LOWER'},
+  {sx:0.00,sy:0.28,sw:0.30,sh:0.46, dx:-1.3,dy:0, tag:'CORNER_L'},
+  {sx:0.70,sy:0.28,sw:0.30,sh:0.46, dx:1.3,dy:0,  tag:'CORNER_R'},
+  {sx:0.36,sy:0.36,sw:0.28,sh:0.30, dx:0,dy:0,   tag:'VOL'},
+];
+function drawStrand(a,b,e,seed){                             // a wet mucous thread — gentle tearing, not a cut
+  const dx=b[0]-a[0], dy=b[1]-a[1], len=Math.hypot(dx,dy)||1, nx=-dy/len, ny=dx/len, segs=12;
+  xc.beginPath();
+  for(let s=0;s<=segs;s++){ const t=s/segs, sag=Math.sin(t*Math.PI);
+    const off=gj(seed*3+s,3.5)+sag*11*(1-e*0.55);
+    const x=a[0]+dx*t+nx*off, y=a[1]+dy*t+ny*off; s?xc.lineTo(x,y):xc.moveTo(x,y); }
+  xc.lineWidth=Math.max(0.5,2.4*(1-e*0.6)); xc.strokeStyle='rgba(220,110,125,'+(0.6*(1-e*0.5))+')'; xc.stroke();
+}
+const seaOff=document.createElement('canvas'); seaOff.width=seaOff.height=240; const seaCtx=seaOff.getContext('2d');
+const seaLayer=document.createElement('canvas'); const slc=seaLayer.getContext('2d');
+function drawCropPart(sx,sy,sw,sh,dx,dy,dw,dh){             // feathered specimen part (soft wet edges)
+  seaCtx.clearRect(0,0,240,240); try{ seaCtx.drawImage(cropCv, sx,sy,sw,sh, 0,0,240,240); }catch(e){ return; }
+  seaCtx.globalCompositeOperation='destination-in';
+  const g=seaCtx.createRadialGradient(120,120,48, 120,120,144);
+  g.addColorStop(0,'#000'); g.addColorStop(0.55,'#000'); g.addColorStop(1,'rgba(0,0,0,0)');
+  seaCtx.fillStyle=g; seaCtx.fillRect(0,0,240,240); seaCtx.globalCompositeOperation='source-over';
+  xc.drawImage(seaOff,0,0,240,240, dx,dy,dw,dh);
+}
+function drawDisassemble(k){
+  if(!hasCrop) return; const R=mouthRect(), W=cropCv.width,H=cropCv.height;
+  const e=(DEBUG&&window.__holdE!=null)?window.__holdE:Math.sin(clamp(k,0,1)*Math.PI);   // tear open → settle back
+  xc.save();
+  PARTS.forEach((P,i)=>{
+    const dw=R.w*P.sw, dh=R.h*P.sh, bx=R.x+P.sx*R.w+dw/2, by=R.y+P.sy*R.h+dh/2;
+    const px=bx+P.dx*R.w*0.20*e, py=by+P.dy*R.h*0.28*e;
+    if(e>0.10) for(let s=0;s<4;s++){                          // thick wet mucous strands between the torn tissue
+      const an=[bx+(rnd(i*4+s)-0.5)*dw*0.4, by+(rnd(i*4+s+1)-0.5)*dh*0.4];
+      const bn=[px+(rnd(i*5+s)-0.5)*dw*0.4, py+(rnd(i*5+s+2)-0.5)*dh*0.4];
+      drawStrand(an,bn,e,i*7+s); }
+    drawCropPart(P.sx*W,P.sy*H,P.sw*W,P.sh*H, px-dw/2,py-dh/2, dw,dh);
+    if(e>0.30){ xc.strokeStyle='rgba(220,90,110,0.45)'; xc.lineWidth=1; cross([px,py],4); }  // one faint wet mark only — abstract
+  });
+  xc.restore();
+}
+function drawDelta(k){
+  const real=lipPx(), tp=tplPx(); if(!real||!tp) return; const g=gstep();
+  strokeOutline(real,CY,1.4);
+  let cx=0,cy=0; real.forEach(([x,y])=>{cx+=x;cy+=y;}); cx/=real.length; cy/=real.length;
+  for(let c=0;c<3;c++){ const sc=1.14+c*0.05+gj(c*3,0.04), js=gj(c+1,6);       // flickering silicone candidates
+    strokeOutline(real.map(([x,y])=>[cx+(x-cx)*sc+js, cy+(y-cy)*(sc+0.28)]), MG+(0.22+0.14*c)+')',1,[3,4]); }
+  if(k>0.3) strokeOutline(tp,MG+'0.9)',1.7,[6,4]);                              // the locked silicone template
+  xc.save(); xc.strokeStyle=MG+'0.6)'; xc.lineWidth=1; for(let i=0;i<real.length;i+=3) arrow(real[i],tp[i]); xc.restore();
+  const R=mouthRect(); xc.fillStyle=MG+'1)'; xc.font="700 12px 'PP Fraktion Mono',monospace";
+  xc.fillText('Δ +'+((18+gj(0,5))|0)+'%', R.x+R.w/2-26, R.y-12+gj(9,2));
+}
+function drawAssembleOutline(k){                              // sparse — the fill itself happens in the shader (silicone spread)
+  const real=lipPx(), tp=tplPx(); if(!real||!tp) return;
+  const cur=real.map((p,i)=>[lerp(p[0],tp[i][0],k)+gj(i,1.2), lerp(p[1],tp[i][1],k)+gj(i+9,1.2)]);
+  strokeOutline(cur,MG+'0.55)',1.2);
+  const R=mouthRect(); xc.save(); xc.strokeStyle=MG+'0.7)'; xc.lineWidth=1;     // injection points dissolving in
+  for(let i=2;i<cur.length;i+=4){ if(rnd(i+gstep())>k*0.7) cross(cur[i],2); } xc.restore();
+  xc.fillStyle=MG+'1)'; xc.font="700 12px 'PP Fraktion Mono',monospace"; xc.fillText('FILL '+((k*100)|0)+'%', R.x+R.w/2-26, R.y-12);
+}
+
+/* --- the collective: a fully procedural flesh ocean (no real/foreign mouths) --- */
+function blobTo(ctx,cx,cy,r,seed,a){
+  const tone=rnd(seed)*0.45;
+  const g=ctx.createRadialGradient(cx,cy,0,cx,cy,r);
+  g.addColorStop(0,'rgba('+((205-tone*70)|0)+','+((55+tone*40)|0)+','+((80+tone*30)|0)+','+(0.88*a)+')');
+  g.addColorStop(0.5,'rgba(150,30,55,'+(0.5*a)+')');
+  g.addColorStop(1,'rgba(40,6,16,0)');
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(cx,cy,r,0,6.283); ctx.fill();
+}
+function drawFeathered(ctx,src,cx,cy,w,h,alpha){             // the viewer's own half-silicone mouth, melting in
+  seaCtx.clearRect(0,0,240,240); try{ seaCtx.drawImage(src,0,0,240,240); }catch(e){ return; }
+  seaCtx.globalCompositeOperation='destination-in';
+  const g=seaCtx.createRadialGradient(120,120,18, 120,120,138);
+  g.addColorStop(0,'#000'); g.addColorStop(0.36,'#000'); g.addColorStop(1,'rgba(0,0,0,0)');
+  seaCtx.fillStyle=g; seaCtx.fillRect(0,0,240,240); seaCtx.globalCompositeOperation='source-over';
+  ctx.save(); ctx.globalAlpha*=(alpha==null?1:alpha); ctx.drawImage(seaOff,0,0,240,240,cx-w/2,cy-h/2,w,h); ctx.restore();
+}
+const SEA_N=46;
+function drawSea(a, drop){
+  if(a<=0) return; const Sz=Math.round(sizePx);
+  if(seaLayer.width!==Sz){ seaLayer.width=seaLayer.height=Sz; }
+  slc.setTransform(1,0,0,1,0,0); slc.globalAlpha=1; slc.clearRect(0,0,Sz,Sz);
+  const bloom=lerp(0.5,1.0,smoothstep(0,0.55,drop));         // the mass blooms open — revealed for the first time
+  slc.save(); slc.translate(Sz/2,Sz/2); slc.scale(bloom,bloom); slc.translate(-Sz/2,-Sz/2);
+  for(let i=0;i<SEA_N;i++){
+    const ang=rnd(i*1.1)*6.2831 + Math.sin(T*0.22+i)*0.6;
+    const rad=Math.pow(rnd(i*2.7+3),0.5) + 0.12*Math.sin(T*0.7+i*1.3);
+    const cx=Sz*(0.5+Math.cos(ang)*rad*0.46)+Math.sin(T*0.9+i)*24;       // writhing churn
+    const cy=Sz*(0.5+Math.sin(ang)*rad*0.44)+Math.cos(T*0.8+i*1.3)*24;
+    const br=0.85+0.3*Math.sin(T*0.6+i*1.7); const base=Sz*(0.13+rnd(i*3.3)*0.13)*br;
+    blobTo(slc, cx, cy, base, i*5.1, 0.95);                   // procedural flesh blobs (no photos)
+  }
+  drawViewerToLayer(slc, Sz, drop);                          // you — into the same mesh
+  slc.restore();
+  // MELT into one abstract animating mesh — single heavy blur over the whole mass
+  xc.save(); xc.globalAlpha=clamp(a,0,1); xc.filter='blur('+(sizePx*0.030).toFixed(1)+'px)'; xc.drawImage(seaLayer,0,0,sizePx,sizePx); xc.filter='none'; xc.restore();
+  xc.save(); xc.globalAlpha=clamp(a,0,1);
+  xc.globalCompositeOperation='multiply'; xc.fillStyle='rgba(120,28,52,0.40)'; xc.fillRect(0,0,sizePx,sizePx);
+  xc.globalCompositeOperation='source-over';
+  const vg=xc.createRadialGradient(sizePx/2,sizePx*0.5,sizePx*0.14, sizePx/2,sizePx*0.5,sizePx*0.66);
+  vg.addColorStop(0,'rgba(6,2,4,0)'); vg.addColorStop(1,'rgba(4,1,3,0.92)'); xc.fillStyle=vg; xc.fillRect(0,0,sizePx,sizePx);
+  xc.restore();
+}
+function drawViewerToLayer(ctx, Sz, drop){
+  if(!hasCrop) return; const src=cropCv, asp=cropAspect;
+  const e=smoothstep(0,1,drop);
+  const cx=Sz*0.5, cy=lerp(Sz*0.14, Sz*0.82, e);             // ENTERS from above, FALLS deep into the ocean
+  const fall=Math.sin(clamp(drop,0,1)*Math.PI);
+  const base=Sz*0.32*lerp(1.8,0.04,e);                       // SHRINKS to nothing — sinks in (no fade)
+  const w=base*(1-0.42*fall), h=(base/asp)*(1+2.1*fall);     // stretches tall while falling
+  ctx.save(); ctx.translate(cx,cy); ctx.rotate(fall*0.6); ctx.translate(-cx,-cy);   // tumbles
+  drawFeathered(ctx, src, cx, cy, w, h, 1.0);
+  ctx.restore();
+}
+
+const hud=document.getElementById('umhud');
+function drawHud(){ if(!DEBUG){ hud.textContent=''; return; }
+  hud.textContent='['+NAME[state]+' '+st.toFixed(1)+'s] cam:'+(camOK?'OK':'NO')+' model:'+delegateUsed+' faces:'+faceCount+' d:'+distort.toFixed(2)+' cap:'+capAmt.toFixed(2)+' inf:'+inflate.toFixed(2)+' sil:'+silicon.toFixed(2)+' cnt:'+count; }
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

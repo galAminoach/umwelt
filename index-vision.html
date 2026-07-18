@@ -1,0 +1,774 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>UMWELT — vision</title>
+<style>
+  @font-face{ font-family:'PP Fraktion Mono'; src:url('fonts/PPFraktionMono-Regular.otf') format('opentype'); font-weight:400; font-display:swap; }
+  @font-face{ font-family:'PP Fraktion Mono'; src:url('fonts/PPFraktionMono-Bold.otf') format('opentype'); font-weight:700; font-display:swap; }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;background:#000;overflow:hidden}
+  body{ display:flex;align-items:center;justify-content:center; background:#000; }
+  /* the screen is the Umwelt of a cold vision system: black cage, warm wet meat pinned inside it */
+  .stage{ position:relative; width:min(94vmin,900px); height:min(94vmin,900px); overflow:hidden; background:#000;
+    box-shadow:0 0 0 1px rgba(0,255,204,0.10), 0 0 60px 8px rgba(0,40,36,0.30), inset 0 0 160px 14px rgba(0,0,0,0.92); }
+  canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+  #gl{z-index:2} #fx{z-index:3}
+  .glass{ position:absolute;inset:0;z-index:4;pointer-events:none;
+    background:radial-gradient(140% 140% at 50% 48%, rgba(0,0,0,0) 62%, rgba(0,0,0,0.55) 100%); mix-blend-mode:multiply; }
+  #umhud{position:absolute;top:6px;left:8px;z-index:6;font:11px 'PP Fraktion Mono',monospace;color:#00ffcc;text-shadow:0 0 4px #000;white-space:pre;pointer-events:none}
+  video{position:absolute;width:2px;height:2px;opacity:0;pointer-events:none;left:-10px;top:-10px}
+</style>
+</head>
+<body>
+  <div class="stage" id="stage">
+    <canvas id="gl"></canvas>
+    <canvas id="fx"></canvas>
+    <div class="glass"></div>
+    <div id="umhud"></div>
+    <video id="vid" playsinline muted></video>
+    <audio id="snd" src="audio/flow.wav" loop preload="auto"></audio>
+  </div>
+
+<script type="module">
+import { FaceLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const cv=document.getElementById('gl');
+const gl=cv.getContext('webgl2',{alpha:false});
+const fxc=document.getElementById('fx'); const xc=fxc.getContext('2d');
+const vid=document.getElementById('vid');
+if(!gl) throw new Error('no webgl2');
+
+/* ---------- sound bed for the flow (looped) ---------- */
+const snd=document.getElementById('snd'); snd.volume=0.9;
+let audioOn=false;
+function startAudio(){ if(audioOn) return; const p=snd.play(); if(p&&p.then) p.then(()=>{audioOn=true;}).catch(()=>{}); else audioOn=true; }
+startAudio();                                                   // try autoplay (kiosk: launch Chrome with --autoplay-policy=no-user-gesture-required)
+for(const ev of ['pointerdown','keydown','touchstart']) window.addEventListener(ev, startAudio);  // else unlock on first gesture
+const clamp=(x,a,b)=>Math.max(a,Math.min(b,x)), lerp=(a,b,t)=>a+(b-a)*t;
+const smoothstep=(a,b,x)=>{const t=clamp((x-a)/(b-a),0,1);return t*t*(3-2*t);};
+const DEBUG=location.search.includes('debug');
+/* COLD palette — the machine's territory. The meat (GL) stays warm; everything 2D is cold cyan/white. */
+const CYAN='#00ffcc', CY='rgba(0,255,204,', WHITE='#ffffff';
+
+/* ===== the mouth — warm wet living meat (live) → fixed specimen (capture).
+   The cold gaze chills it where it scans (uScanY) and leaves a permanent residual (uChill). ===== */
+const VERT=`#version 300 es
+in vec2 c; out vec2 uv; void main(){ uv=c*0.5+0.5; gl_Position=vec4(c,0.,1.); }`;
+const FRAG=`#version 300 es
+precision highp float; in vec2 uv; out vec4 O;
+uniform sampler2D uMouth; uniform float uTime,uHasCrop,uAspect,uCapture,uInflate,uScanY,uChill,uStretch,uFace,uWet;
+float hash(vec2 p){ p=fract(p*vec2(123.34,456.21)); p+=dot(p,p+45.32); return fract(p.x*p.y); }
+// the operating-table / inside-the-DB graticule: dim, DEAD, behind the meat.
+// anisotropic — dense ruled record-rows (horizontal) + sparse barrel-curved meridians (vertical).
+vec3 graticule(vec2 p){
+  vec2 q=p-0.5; float bar=0.06;                                  // barely-there barrel on the meridians only
+  float mx=q.x*(1.0+bar*(q.y*q.y*4.0-q.x*q.x));
+  float rows=fract(p.y/0.026);                                   // ledger rows ~ every 0.026
+  float rl=smoothstep(0.5,0.0,abs(rows-0.5)*2.0-0.93);
+  float fifth=(mod(floor(p.y/0.026),5.0)<0.5)?1.0:0.0;           // every 5th row brighter
+  float mer=fract((mx+0.5)/0.085);                               // sparse meridians ~ every 0.085
+  float ml=smoothstep(0.5,0.0,abs(mer-0.5)*2.0-0.96);
+  float g=rl*(0.06+0.07*fifth)+ml*0.05;
+  return vec3(0.0,0.85,0.72)*g;                                  // dim teal-cyan
+}
+float vnoise(vec2 p){ vec2 i=floor(p),f=fract(p); f=f*f*(3.-2.*f);
+  float a=hash(i),b=hash(i+vec2(1,0)),c=hash(i+vec2(0,1)),d=hash(i+vec2(1,1));
+  return mix(mix(a,b,f.x),mix(c,d,f.x),f.y); }
+float fbm(vec2 p){ float s=0.,a=.5; for(int i=0;i<4;i++){ s+=a*vnoise(p); p*=2.04; a*=.5;} return s; }
+vec3 wet3(vec3 col){ col=pow(max(col,0.),vec3(1.06)); vec3 wine=vec3(0.5,0.07,0.17); return mix(col, col*wine*2.6, 0.15); }
+void main(){
+  vec2 p=uv;
+  vec2 box=vec2(0.40*(1.0+uStretch*0.55), 0.40/max(uAspect,1.0)*(1.0-uStretch*0.10));  // STRESS: caliper pulls width
+  vec2 d=(p-vec2(0.5,0.5))/box;
+  float t=uTime; float cap=clamp(uCapture,0.0,1.0);
+  // faint life only — no psychedelic loop; the meat breathes, the cold gaze does the moving
+  vec2 flow=vec2(fbm(d*3.2+t*0.25), fbm(d*3.2 - t*0.20+7.0))-0.5;
+  float wet=clamp(uWet,0.0,1.0);                                 // 0 = sharp lip cutout · 1 = deliberately-wet membrane (ramped, never a hard cut)
+  float live=0.020*wet;                                          // wobble only as it wets
+  vec2 dd=d + flow*live;
+  vec2 cuv=clamp(dd*0.5+0.5,0.0,1.0);
+  cuv = clamp(0.5 + (cuv-0.5)/(1.0+uInflate*vec2(0.30,0.74)), 0.0, 1.0);   // NORMALIZE: meat pulled toward mean volume
+  vec3 ground=vec3(0.012,0.004,0.009)+graticule(p);             // the measuring surface, always behind
+  vec3 flesh;
+  if(uHasCrop>0.5){
+    vec3 c0=texture(uMouth,cuv).rgb;
+    vec2 e=1.8/vec2(textureSize(uMouth,0)), e2=4.2/vec2(textureSize(uMouth,0));  // multi-scale unsharp ALWAYS — fights low-res webcam softness
+    vec3 bl=(texture(uMouth,cuv+vec2(e.x,0.0)).rgb+texture(uMouth,cuv-vec2(e.x,0.0)).rgb
+            +texture(uMouth,cuv+vec2(0.0,e.y)).rgb+texture(uMouth,cuv-vec2(0.0,e.y)).rgb)*0.25;
+    vec3 bl2=(texture(uMouth,cuv+vec2(e2.x,0.0)).rgb+texture(uMouth,cuv-vec2(e2.x,0.0)).rgb
+             +texture(uMouth,cuv+vec2(0.0,e2.y)).rgb+texture(uMouth,cuv-vec2(0.0,e2.y)).rgb)*0.25;
+    float shp=mix(2.6,0.2,wet)+cap*1.2;                         // sharp when not wet; extra crunch on capture; softens only as wet ramps
+    c0=c0+(c0-bl)*shp + (c0-bl2)*shp*0.45;                      // fine + coarse detail
+    c0=mix(c0,(c0-0.5)*(1.0+0.42*(1.0-wet))+0.5, 0.7);
+    flesh=clamp(c0,0.0,1.0);
+  } else flesh=vec3(0.30,0.06,0.12);
+  flesh=mix(flesh, wet3(flesh), 0.42);                          // warm wine grade (colour, NOT blur) — always on
+  float sheen=pow(max(0.0,1.0-length(d*vec2(0.8,1.2))),3.0);
+  flesh+=sheen*vec3(1.0,0.9,0.94)*(0.16+0.12*wet);             // wet sheen grows with wetness
+  // --- the gaze chills the meat: desaturate toward grey-cyan under the scan + a permanent residual ---
+  float chill=clamp(uChill,0.0,1.0);
+  if(uScanY>=0.0){ float passed=smoothstep(uScanY+0.02, uScanY-0.22, p.y); chill=max(chill, passed*0.55); }
+  float g=dot(flesh,vec3(0.299,0.587,0.114));
+  vec3 cold=mix(vec3(g), vec3(0.55,0.86,0.86)*g*1.25, 0.55);
+  flesh=mix(flesh, cold, chill);
+  // membrane mask
+  vec2 dM=d/(1.0+uInflate*vec2(0.28,0.60));
+  float r=length(dM*vec2(0.80,1.0));
+  r += (fbm(uv*3.4+t*0.18)-0.5)*0.12*wet;                       // edge only ripples once wet
+  float lo=mix(0.86,0.46,wet), hi=1.01;                         // tight crisp silhouette when sharp → soft membrane as it wets
+  float mask=smoothstep(hi,lo,r)*(1.0-clamp(uFace,0.0,1.0));     // uFace=1 → grid only (the meat is replaced/absent)
+  vec3 col=mix(ground, flesh, mask);
+  float vig=smoothstep(1.6,0.35,length((p-0.5)*2.0)); col*=0.62+0.38*vig;
+  col+=(hash(p*vec2(900.0)+t)-0.5)*0.008;
+  O=vec4(max(col,0.0),1.0);
+}`;
+function sh(ty,src){ const s=gl.createShader(ty); gl.shaderSource(s,src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+const prog=gl.createProgram(); gl.attachShader(prog,sh(gl.VERTEX_SHADER,VERT)); gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,FRAG));
+gl.linkProgram(prog); if(!gl.getProgramParameter(prog,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+const quad=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,quad);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+const cl=gl.getAttribLocation(prog,'c'); gl.enableVertexAttribArray(cl); gl.vertexAttribPointer(cl,2,gl.FLOAT,false,0,0);
+const U=(n)=>gl.getUniformLocation(prog,n);
+const u={ mouth:U('uMouth'),time:U('uTime'),hasCrop:U('uHasCrop'),aspect:U('uAspect'),capture:U('uCapture'),inflate:U('uInflate'),scanY:U('uScanY'),chill:U('uChill'),stretch:U('uStretch'),face:U('uFace'),wet:U('uWet') };
+gl.uniform1i(u.mouth,0);
+const mouthTex=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,mouthTex);
+for(const pn of [gl.TEXTURE_WRAP_S,gl.TEXTURE_WRAP_T]) gl.texParameteri(gl.TEXTURE_2D,pn,gl.CLAMP_TO_EDGE);
+for(const pn of [gl.TEXTURE_MIN_FILTER,gl.TEXTURE_MAG_FILTER]) gl.texParameteri(gl.TEXTURE_2D,pn,gl.LINEAR);
+
+let DPR=Math.min(window.devicePixelRatio||1,1.5), sizePx=900;
+function resize(){ const r=cv.getBoundingClientRect(); sizePx=r.width||900;
+  cv.width=fxc.width=Math.round(sizePx*DPR); cv.height=fxc.height=Math.round(sizePx*DPR);
+  gl.viewport(0,0,cv.width,cv.height); xc.setTransform(DPR,0,0,DPR,0,0); }
+window.addEventListener('resize',resize); resize();
+
+/* mouth display rect on the 2D overlay (matches the shader's box mapping) */
+function mouthRect(){ const bx=0.40, by=0.40/Math.max(stillAspect,1.0);
+  return { x:(0.5-bx)*sizePx, y:(0.5-by)*sizePx, w:2*bx*sizePx, h:2*by*sizePx }; }
+function INSET(){ return sizePx*0.052; }                                   // the cold cage: ~47px @900
+
+/* ---------- crop the live video to the lips ---------- */
+const cropCv=document.createElement('canvas'); const cctx=cropCv.getContext('2d');
+let hasCrop=0, cropAspect=1.7, stillAspect=1.7;
+function updateCrop(){
+  if(frozen) return;
+  if(!camOK||vid.readyState<2||!vid.videoWidth) return;
+  const vw=vid.videoWidth,vh=vid.videoHeight; const sw=2*vidCrop.hx*vw, sh=2*vidCrop.hy*vh; if(sw<4||sh<4) return;
+  cropAspect=clamp(sw/sh,1.0,3.0); cropCv.width=1024; cropCv.height=Math.max(2,Math.round(1024/cropAspect));   // higher-res crop → sharp cutout, not a smear
+  cctx.save(); cctx.translate(cropCv.width,0); cctx.scale(-1,1);
+  try{ cctx.drawImage(vid,(vidCrop.cx-vidCrop.hx)*vw,(vidCrop.cy-vidCrop.hy)*vh,sw,sh,0,0,cropCv.width,cropCv.height); }catch(e){ cctx.restore(); return; }
+  cctx.restore();
+  gl.bindTexture(gl.TEXTURE_2D,mouthTex); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,cropCv); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false); hasCrop=1;
+}
+/* live lip ring (crop-normalised, top-down) — used for the isolation contour + measurement */
+function ringFromLM(L){ if(!L) return null; const cx=vidCrop.cx,cy=vidCrop.cy,hx=vidCrop.hx,hy=vidCrop.hy;
+  return LIPS.map(k=>{ const uX=1-(L[k].x-(cx-hx))/(2*hx); const v=(L[k].y-(cy-hy))/(2*hy); return [clamp(uX,0,1),clamp(v,0,1)]; }); }
+let capLip=null, liveRing=null;
+function snapshotCapture(){
+  stillAspect=cropAspect; capLip=ringFromLM(lastLM);
+  if(capLip){ devPct=deviationOf(capLip); updateMean(capLip); }              // real statistic + corpus grows
+  count++; localStorage.setItem(COUNT_KEY,String(count));
+}
+
+/* ---------- the honest AVERAGE (computed, not invented) ----------
+   Shape-only (translation+scale invariant) mean of every lip ring the system has seen.
+   Seeded with a canonical reference corpus so "the mean" exists from frame one; each visitor updates it. */
+function centerScale(ring){ let cx=0,cy=0; for(const[x,y]of ring){cx+=x;cy+=y;} cx/=ring.length;cy/=ring.length;
+  let s=0; const c=ring.map(([x,y])=>{const dx=x-cx,dy=y-cy; s+=dx*dx+dy*dy; return [dx,dy];}); s=Math.sqrt(s/ring.length)||1;
+  return c.map(([dx,dy])=>[dx/s,dy/s]); }                                    // centroid 0, RMS radius 1
+/* realistic outer-lip ring in LIPS winding (normalised lip-bbox coords) — a true average lip shape.
+   x is mirrored (1-x) to match the selfie-mirrored display rings (ringFromLM uses uX=1-...). */
+const CANON=centerScale([
+  [0.00,0.50],[0.12,0.32],[0.22,0.22],[0.31,0.17],[0.42,0.14],[0.50,0.16],[0.58,0.14],[0.69,0.17],[0.78,0.22],[0.88,0.32],[1.00,0.50],
+  [0.88,0.66],[0.78,0.76],[0.69,0.82],[0.58,0.85],[0.50,0.86],[0.42,0.85],[0.31,0.82],[0.22,0.76],[0.12,0.66] ].map(([x,y])=>[1-x,y]));
+const MEAN_KEY='umwelt.vision.mean', SEED_N=35;
+let meanShape, meanN;
+(function loadMean(){ try{ const s=JSON.parse(localStorage.getItem(MEAN_KEY)||'null');
+  if(s&&s.shape&&s.shape.length===20){ meanShape=s.shape; meanN=s.n||SEED_N; return; } }catch(e){}
+  meanShape=CANON.map(p=>p.slice()); meanN=SEED_N; })();
+function deviationOf(ring){ const s=centerScale(ring); let e=0; for(let i=0;i<20;i++){ const dx=s[i][0]-meanShape[i][0], dy=s[i][1]-meanShape[i][1]; e+=dx*dx+dy*dy; }
+  return clamp(Math.sqrt(e/20)*78, 0, 99.9); }                              // real RMS shape-distance → %
+function updateMean(ring){ const s=centerScale(ring); const n=meanN;
+  for(let i=0;i<20;i++){ meanShape[i][0]=(meanShape[i][0]*n+s[i][0])/(n+1); meanShape[i][1]=(meanShape[i][1]*n+s[i][1])/(n+1); }
+  meanN=n+1; try{ localStorage.setItem(MEAN_KEY,JSON.stringify({shape:meanShape,n:meanN})); }catch(e){} }
+/* the mean SHAPE re-fitted to a captured ring's own centroid+scale → the "AVERAGE" template overlaid in place */
+function meanTemplateFor(ring){ if(!ring) return null; let cx=0,cy=0; for(const[x,y]of ring){cx+=x;cy+=y;} cx/=ring.length;cy/=ring.length;
+  let s=0; for(const[x,y]of ring){s+=(x-cx)*(x-cx)+(y-cy)*(y-cy);} s=Math.sqrt(s/ring.length)||1;
+  return meanShape.map(([dx,dy])=>[cx+dx*s, cy+dy*s]); }
+
+/* ---------- catalog material (real cutouts) for COMPARE flicker ---------- */
+const lipImgs=[]; const NLIP=35; for(let i=0;i<NLIP;i++){ const im=new Image(); im.src='lips/lip'+i+'.png'; im.onload=()=>lipImgs[i]=im; }
+
+/* ---------- MediaPipe ---------- */
+let liveLM=null, camOK=false, lastVT=-1, delegateUsed='-', faceCount=0, lastLM=null;
+const LIPS=[61,185,40,39,37,0,267,269,270,409,291,375,321,405,314,17,84,181,91,146];
+const vidCrop={cx:0.5,cy:0.62,hx:0.14,hy:0.10}; let presence=0, lastSeen=0;
+const COUNT_KEY='umwelt.vision.count'; let count=parseInt(localStorage.getItem(COUNT_KEY)||'0',10); if(isNaN(count))count=0;
+function log(...a){ console.log('[umwelt]',...a); }
+async function makeLandmarker(d){ const fs=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  return FaceLandmarker.createFromOptions(fs,{baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",delegate:d},runningMode:"VIDEO",numFaces:1}); }
+let usingDemo=false;
+async function useDemoFace(){                                   // still stand-in face → drives the flow when there's no camera
+  const fimg=new Image(); fimg.src='faces/face1.jpg'; await fimg.decode();
+  const dc=document.createElement('canvas'); dc.width=dc.height=640; const dx=dc.getContext('2d');
+  const cs=Math.max(640/fimg.naturalWidth,640/fimg.naturalHeight);
+  (function dr(){ dx.fillStyle='#000'; dx.fillRect(0,0,640,640); dx.drawImage(fimg,(640-fimg.naturalWidth*cs)/2,(640-fimg.naturalHeight*cs)/2,fimg.naturalWidth*cs,fimg.naturalHeight*cs); requestAnimationFrame(dr); })();
+  vid.srcObject=dc.captureStream(30); await vid.play(); camOK=true; usingDemo=true;
+}
+async function goLive(){
+  if(location.search.includes('nocam')){ camOK=false; return; }
+  try{ liveLM=await makeLandmarker("GPU"); delegateUsed='GPU'; }catch(e){ try{ liveLM=await makeLandmarker("CPU"); delegateUsed='CPU'; }catch(e2){ liveLM=null; delegateUsed='FAIL'; log('LM FAIL',e2?.message); } }
+  if(location.search.includes('demoface')){ try{ await useDemoFace(); }catch(e){ camOK=false; log('demo FAIL',e?.message); } return; }
+  try{                                                          // camera is the default
+    const st=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:1920},height:{ideal:1920}},audio:false});   // higher res → more mouth pixels, less upscale blur
+    vid.srcObject=st; await vid.play(); camOK=true;
+  }catch(e){ log('cam unavailable → demo fallback', e?.message);   // denied/busy/none → never sit blank
+    try{ await useDemoFace(); }catch(e2){ camOK=false; log('demo FAIL',e2?.message); } }
+}
+function readMouth(nowMs){
+  if(!liveLM||!camOK||vid.readyState<2) return; if(vid.currentTime===lastVT) return; lastVT=vid.currentTime;
+  let res; try{ res=liveLM.detectForVideo(vid,nowMs); }catch(e){ return; }
+  faceCount=(res&&res.faceLandmarks)?res.faceLandmarks.length:0;
+  if(faceCount){ const L=res.faceLandmarks[0]; lastLM=L; let mnx=1,mxx=0,mny=1,mxy=0;
+    for(const k of LIPS){ const x=L[k].x,y=L[k].y; if(x<mnx)mnx=x; if(x>mxx)mxx=x; if(y<mny)mny=y; if(y>mxy)mxy=y; }
+    const cx=(mnx+mxx)/2, cy=(mny+mxy)/2, hx=(mxx-mnx)/2*1.16, hy=(mxy-mny)/2*1.42;
+    if(!frozen){ vidCrop.cx=lerp(vidCrop.cx,cx,0.4); vidCrop.cy=lerp(vidCrop.cy,cy,0.4); vidCrop.hx=lerp(vidCrop.hx,Math.max(0.04,hx),0.3); vidCrop.hy=lerp(vidCrop.hy,Math.max(0.03,hy),0.3); liveRing=ringFromLM(L); }
+    let fnx=1,fxx=0,fny=1,fxy=0;                                            // full-face bbox (all 478) for the mesh phase
+    for(let i=0;i<L.length;i++){ const x=L[i].x,y=L[i].y; if(x<fnx)fnx=x; if(x>fxx)fxx=x; if(y<fny)fny=y; if(y>fxy)fxy=y; }
+    const fcx=(fnx+fxx)/2, fcy=(fny+fxy)/2, fhx=(fxx-fnx)/2*1.18, fhy=(fxy-fny)/2*1.18;
+    faceBox.cx=lerp(faceBox.cx,fcx,0.4); faceBox.cy=lerp(faceBox.cy,fcy,0.4); faceBox.hx=lerp(faceBox.hx,Math.max(0.05,fhx),0.3); faceBox.hy=lerp(faceBox.hy,Math.max(0.05,fhy),0.3);
+    if(!faceEdges && L.length>=468) buildFaceMesh(L);                        // cache mesh topology once (stable)
+    lastSeen=performance.now();
+  }
+}
+goLive();
+
+/* ===========================  FACIAL-RECOGNITION MESH (Consent-style)  ===========================
+   One-time Bowyer–Watson Delaunay over the 478 landmarks → cached edge topology (≤0.12 weave);
+   live vertex positions each frame. Per-vertex seed for inspection-order ink-on. */
+const faceBox={cx:0.5,cy:0.5,hx:0.18,hy:0.22};                  // smoothed full-face bbox (set in readMouth)
+const ACCENT=[1,4,33,133,362,263,13,14,152,234,454];            // the 11 coroner ID points (eyes/nose/mouth/chin/tragus)
+let faceEdges=null, faceSeed=null, faceRegion=null;
+function triangulate(pts){                                       // Bowyer–Watson; pts=[[x,y],...] in 0..1
+  const n=pts.length; if(n<3) return [];
+  let minx=1e9,miny=1e9,maxx=-1e9,maxy=-1e9;
+  for(const[x,y]of pts){ if(x<minx)minx=x; if(y<miny)miny=y; if(x>maxx)maxx=x; if(y>maxy)maxy=y; }
+  const dm=Math.max(maxx-minx,maxy-miny)||1, mx=(minx+maxx)/2, my=(miny+maxy)/2;
+  const P=pts.map(p=>[p[0],p[1]]); const s=n;
+  P.push([mx-20*dm,my-dm],[mx,my+20*dm],[mx+20*dm,my-dm]);
+  const circ=(a,b,c)=>{ const ax=P[a][0],ay=P[a][1],bx=P[b][0],by=P[b][1],cx=P[c][0],cy=P[c][1];
+    const ab=ax*ax+ay*ay,cd=bx*bx+by*by, ef=cx*cx+cy*cy;
+    const D=2*(ax*(by-cy)+bx*(cy-ay)+cx*(ay-by)); if(Math.abs(D)<1e-12) return null;
+    const ux=(ab*(by-cy)+cd*(cy-ay)+ef*(ay-by))/D, uy=(ab*(cx-bx)+cd*(ax-cx)+ef*(bx-ax))/D;
+    return {x:ux,y:uy,r:(ux-ax)*(ux-ax)+(uy-ay)*(uy-ay)}; };
+  let tris=[[s,s+1,s+2]];
+  for(let i=0;i<n;i++){ const bad=[];
+    for(const t of tris){ const c=circ(t[0],t[1],t[2]); if(c&&((P[i][0]-c.x)**2+(P[i][1]-c.y)**2)<=c.r) bad.push(t); }
+    const edges=[];
+    for(const t of bad){ const es=[[t[0],t[1]],[t[1],t[2]],[t[2],t[0]]];
+      for(const e of es){ let shared=false; for(const t2 of bad){ if(t2===t)continue; if(t2.includes(e[0])&&t2.includes(e[1])){shared=true;break;} } if(!shared) edges.push(e); } }
+    tris=tris.filter(t=>!bad.includes(t)); for(const e of edges) tris.push([e[0],e[1],i]); }
+  return tris.filter(t=>t[0]<n&&t[1]<n&&t[2]<n);
+}
+function buildFaceMesh(L){
+  const pts=[]; for(let i=0;i<468;i++) pts.push([L[i].x,L[i].y]);
+  const tris=triangulate(pts); const set=new Set(); const MAXLEN=0.12;
+  const add=(a,b)=>{ if(a>b){const t=a;a=b;b=t;} if(Math.hypot(pts[a][0]-pts[b][0],pts[a][1]-pts[b][1])<=MAXLEN) set.add(a*1000+b); };
+  for(const t of tris){ add(t[0],t[1]); add(t[1],t[2]); add(t[2],t[0]); }
+  faceEdges=[...set].map(k=>[Math.floor(k/1000),k%1000]);
+  faceSeed=new Float32Array(468); faceRegion=new Int8Array(468); const b=faceBox;
+  for(let i=0;i<468;i++){ faceSeed[i]=rnd(i*2.17);
+    const u=(L[i].x-(b.cx-b.hx))/(2*b.hx), v=(L[i].y-(b.cy-b.hy))/(2*b.hy);  // region for discard order
+    faceRegion[i]=classifyRegion(u,v); }
+}
+/* 11 clinical body-part regions; ARTICULATORY (mouth, 10) is RETAINED — discard runs by .prio, mouth last */
+const BPARTS=[
+  {label:'OCULAR·L',prio:0},{label:'OCULAR·R',prio:0},{label:'SUPRAORBITAL·L',prio:1},{label:'SUPRAORBITAL·R',prio:1},
+  {label:'NASAL',prio:2},{label:'AURICULAR·L',prio:3},{label:'AURICULAR·R',prio:3},{label:'BUCCAL·L',prio:4},{label:'BUCCAL·R',prio:4},
+  {label:'MANDIBULAR',prio:5},{label:'ARTICULATORY',prio:99} ];
+function classifyRegion(u,v){ const c=u-0.5;
+  if(v>=0.60 && v<=0.86 && Math.abs(c)<0.26) return 10;          // ARTICULATORY (mouth) — retained
+  if(Math.abs(c)>0.40) return c<0?5:6;                           // auricular L/R (ears)
+  if(v<0.30) return c<0?2:3;                                     // supraorbital L/R (brows)
+  if(v<0.45){ if(Math.abs(c)<0.10) return 4; return c<0?0:1; }   // ocular L/R (eyes) · nose bridge
+  if(v<0.60){ if(Math.abs(c)<0.14) return 4; return c<0?7:8; }   // nasal centre · buccal L/R (cheeks)
+  return 9;                                                      // mandibular (jaw/chin)
+}
+/* live landmark k → mirrored screen position inside the specimen plate */
+function faceVtx(L,k,plate){ const b=faceBox; const uX=1-((L[k].x-(b.cx-b.hx))/(2*b.hx)); const v=(L[k].y-(b.cy-b.hy))/(2*b.hy);
+  return [plate.x+clamp(uX,-0.3,1.3)*plate.w, plate.y+clamp(v,-0.3,1.3)*plate.h]; }
+function facePlate(){ const w=sizePx*0.64, h=w*1.18, x=(sizePx-w)/2, y=sizePx*0.15; return {x,y,w,h}; }
+
+/* ===========================  REAL MOUTH-SWAP (optional COMPARE material, isolated :8001) =========================== */
+const SWAP = !location.search.includes('noswap');              // real flux mouth-swap (seamless inpaint via :8001). Slow to bake (~28s) → revealed in COMPARE once ready.
+const SWAP_BASE = 'http://localhost:8001/api/v1';
+let DONOR_IDS=[];                                              // FIXED distinct donor pool (swap/donors.json) — viewer uploads can NEVER pollute it
+fetch('swap/donors.json',{cache:'no-store'}).then(r=>r.json()).then(a=>{ if(Array.isArray(a)) DONOR_IDS=a; console.log('[umwelt] donors',DONOR_IDS.length); }).catch(()=>{});
+let swapMouths=[], swapState='idle', swapDestBbox=null;
+const fullCv=document.createElement('canvas'), fctx2=fullCv.getContext('2d');
+const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
+const jget=async(uu)=>{ const r=await fetch(SWAP_BASE+uu); if(!r.ok) throw new Error('GET '+r.status); return r.json(); };
+const jpost=async(uu,b)=>{ const r=await fetch(SWAP_BASE+uu,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}); if(!r.ok) throw new Error('POST '+r.status); return r.json(); };
+const blobToImg=(b)=>new Promise((res,rej)=>{ const im=new Image(); im.onload=()=>res(im); im.onerror=rej; im.src=URL.createObjectURL(b); });
+async function kickoffSwaps(){
+  if(!SWAP || swapState!=='idle' || !camOK || vid.readyState<2 || !vid.videoWidth) return;
+  swapState='running'; swapMouths=[];
+  try{
+    fullCv.width=vid.videoWidth; fullCv.height=vid.videoHeight; fctx2.drawImage(vid,0,0);
+    const blob=await new Promise(res=>fullCv.toBlob(res,'image/jpeg',0.92));
+    const fd=new FormData(); fd.append('image',blob,'viewer.jpg'); fd.append('rotation','center'); fd.append('kind','portrait');
+    const uj=await (await fetch(SWAP_BASE+'/upload',{method:'POST',body:fd})).json();
+    let dest=uj.existing_image_id;
+    if(!(dest && uj.existing_has_segmentations)){ const dp=await jpost('/session/'+uj.session_id+'/detect-pose',{}); dest=dp.image_id; }
+    if(!dest) throw new Error('no dest');
+    let mouth=null;
+    for(let i=0;i<40 && swapState==='running';i++){ const bp=await jget('/images/'+dest+'/body-parts');
+      const m=(bp.body_parts||[]).find(p=>p.body_part_id==='mouth'); if(m&&m.bbox_width){ mouth=m; break; } await sleep(400); }
+    if(!mouth) throw new Error('no mouth'); swapDestBbox=mouth;
+    const donors=DONOR_IDS.filter(id=>id&&id!==dest).slice(0,4);   // fixed distinct donors (4 → fewer flux calls = less $ / faster first result)
+    if(!donors.length) throw new Error('no donors (swap/donors.json empty?)');
+    const bi=await jpost('/images/'+dest+'/bulk-swap',{items:donors.map(s=>({part_id:'mouth',source_image_id:s,strength:0.85})),base_swap_ids:[]});
+    const ids=(bi.results||[]).map(r=>r.swap_id).filter(Boolean);
+    await Promise.allSettled(ids.map(async(sid)=>{
+      for(let i=0;i<80 && swapState==='running';i++){ const s=await jget('/swaps/'+sid+'/status');
+        if(s.status==='completed'){ const m=await fetchCropMouth(sid); if(m) swapMouths.push(m); return; }
+        if(s.status==='failed') return; await sleep(i?150:60); }
+    }));
+    swapState = swapMouths.length ? 'done':'fail';
+  }catch(e){ console.warn('[umwelt] swap',e?.message||e); swapState='fail'; }
+}
+async function fetchCropMouth(sid){
+  try{ const im=await blobToImg(await (await fetch(SWAP_BASE+'/swaps/'+sid+'/composite')).blob());
+    const b=swapDestBbox; const px=b.bbox_width*0.40, py=b.bbox_height*0.75;
+    const sx=Math.max(0,b.bbox_x1-px), sy=Math.max(0,b.bbox_y1-py);
+    const sw=Math.min(im.width-sx,b.bbox_width+2*px), sh=Math.min(im.height-sy,b.bbox_height+2*py);
+    const c=document.createElement('canvas'); c.width=Math.max(2,Math.round(sw)); c.height=Math.max(2,Math.round(sh));
+    c.getContext('2d').drawImage(im,sx,sy,sw,sh,0,0,c.width,c.height); return {canvas:c, aspect:c.width/c.height};
+  }catch(e){ return null; }
+}
+
+/* ===========================  STATE MACHINE  =========================== */
+const S={STANDBY:0,FACE:1,DISFACE:2,ACQUIRE:3,CAPTURE:4,COMPARE:5,MEASURE:6,STRESS:7,DISASSEMBLE:8,DELTA:9,ASSEMBLE:10,ABSORB:11,ARCHIVE:12,RETURN:13};
+const NAME=Object.keys(S);
+const MODE=['STANDBY','RECOGNISE','PURGE','ACQUIRE','CAPTURE','COMPARE','MEASURE','STRESS','SEGMENT','DELTA','NORMALIZE','HELD','ARCHIVE','STANDBY'];
+const DUR={ [S.FACE]:4.6,[S.DISFACE]:5.4,[S.ACQUIRE]:5.0,[S.CAPTURE]:2.0,[S.COMPARE]:6.0,[S.MEASURE]:7.0,[S.STRESS]:4.5,[S.DISASSEMBLE]:5.5,[S.DELTA]:4.0,[S.ASSEMBLE]:8.0,[S.ABSORB]:3.0,[S.ARCHIVE]:6.0,[S.RETURN]:1.6 };
+const MEAT_OFF=new Set([S.STANDBY,S.FACE,S.DISFACE,S.DISASSEMBLE,S.ARCHIVE,S.RETURN]);   // grid only (no GL meat)
+let state=S.STANDBY, st=0, frozen=false, capAmt=0, inflate=0, scanY=-1, chill=0, stretch=0, wetAmt=0, disfaceWaited=0, compareWaited=0;
+let devPct=31.6, devShown=31.6, normPct=0, resolvePct=0, modeSwapAt=-9, frameCount=0;
+function enter(ns){ state=ns; st=0; modeSwapAt=T;
+  if(ns===S.CAPTURE){ frozen=true; snapshotCapture(); devShown=devPct; }
+  if(ns===S.FACE && SWAP){ kickoffSwaps(); }                    // fire the flux swap at recognition → ~40s to bake, revealed in COMPARE
+  if(ns===S.COMPARE){ compareWaited=0; }
+  if(ns===S.STANDBY){ frozen=false; chill=0; stretch=0; capLip=null; if(SWAP){ swapState='idle'; swapMouths=[]; } }
+}
+function tickState(dt, now){
+  st+=dt; frameCount++;
+  if(DEBUG && window.__holdState===state && window.__holdK!=null && DUR[state]) st=window.__holdK*DUR[state];  // debug: pin progress
+  const held = DEBUG && window.__holdState===state;
+  const seen=(now-lastSeen)<250; presence=lerp(presence, seen?1:0, 1-Math.exp(-(seen?5:1.5)*dt));
+  let tCap=capAmt, tInfl=inflate, tScan=-1, tChill=chill, tStr=0, k=DUR[state]?clamp(st/DUR[state],0,1):0;
+  switch(state){
+    case S.STANDBY: tCap=lerp(capAmt,0,1-Math.exp(-4*dt)); tInfl=0; tChill=0;
+      if(!held && presence>0.6 && st>1.6 && faceEdges) enter(S.FACE); break;
+    case S.FACE: tCap=0; tChill=0;                                              // recognise: mesh inks on, holds live = me
+      if(!held){ if(presence<0.25) enter(S.STANDBY); else if(st>=DUR[state]) enter(S.DISFACE); } break;
+    case S.DISFACE: tCap=0; tChill=0;                                           // strip the face to the mouth, then converge
+      if(!held && st>=DUR[state]) enter(S.ACQUIRE); break;
+    case S.ACQUIRE: tCap=0; tInfl=0; tScan=Math.floor(k*24)/24; tChill=lerp(0,0.30,k);
+      if(!held){ if(presence<0.25) enter(S.STANDBY); else if(st>=DUR[state]) enter(S.CAPTURE); } break;
+    case S.CAPTURE: tCap=lerp(capAmt,1,1-Math.exp(-3.5*dt)); tInfl=0; tChill=0.30; if(!held && st>=DUR[state]) enter(S.COMPARE); break;
+    case S.COMPARE: tCap=1; tInfl=0; tChill=0.30;                               // wait for the real flux swap to bake, then hold a beat on the seamless result
+      if(!held && SWAP && !swapMouths.length && swapState!=='fail' && compareWaited<26.0){ st=Math.min(st,DUR[state]*0.45); compareWaited+=dt; }
+      resolvePct = swapMouths.length ? 100 : Math.min(97, 8+compareWaited/26*89);
+      if(!held && st>=DUR[state]) enter(S.MEASURE); break;
+    case S.MEASURE: tCap=1; tInfl=0; tChill=0.30; if(!held && st>=DUR[state]) enter(S.STRESS); break;
+    case S.STRESS: tCap=1; tInfl=0; tChill=0.34;                                // caliper ratchets the width out, then recoils
+      tStr=(k<0.80)?(Math.floor(k/0.80*7)/7):lerp(1,0,smoothstep(0.80,1.0,k));
+      if(!held && st>=DUR[state]) enter(S.DISASSEMBLE); break;
+    case S.DISASSEMBLE: tCap=1; tInfl=0; tChill=0.32; if(!held && st>=DUR[state]) enter(S.DELTA); break;
+    case S.DELTA: tCap=1; tInfl=0; tChill=0.32; if(!held && st>=DUR[state]) enter(S.ASSEMBLE); break;
+    case S.ASSEMBLE: tCap=1; tInfl=clamp(k,0,1); tChill=lerp(0.32,0.42,k); normPct=k*100; devShown=devPct*(1-k);
+      if(!held && st>=DUR[state]) enter(S.ABSORB); break;
+    case S.ABSORB: tCap=1; tInfl=1.0; tChill=0.42; devShown=0; normPct=100; if(!held && st>=DUR[state]) enter(S.ARCHIVE); break;
+    case S.ARCHIVE: tCap=1; tInfl=1.0; tChill=0.42; if(!held && st>=DUR[state]) enter(S.RETURN); break;
+    case S.RETURN: tCap=lerp(capAmt,0,1-Math.exp(-3*dt)); tInfl=0; tChill=lerp(chill,0,1-Math.exp(-2.5*dt)); if(!held && st>=DUR[state]) enter(S.STANDBY); break;
+  }
+  capAmt=tCap; inflate=tInfl; scanY=tScan; chill=tChill; stretch=tStr;
+  // CLINICAL MIDDLE STAYS SHARP for legibility (the examination must read clearly); the deliberate wet-in happens only at the END (the specimen relaxes)
+  let tWet=0.05;                                                            // near-sharp baseline (warm colour is separate, always on)
+  if(state<=S.CAPTURE) tWet=0;                                             // crisp cutout through capture
+  else if(state===S.ABSORB) tWet=lerp(0.05,0.62,k);                        // wet-in at the end, slow + deliberate
+  else if(state===S.ARCHIVE) tWet=0.62;
+  else if(state===S.RETURN) tWet=lerp(wetAmt,0,1-Math.exp(-3*dt));
+  wetAmt=tWet;
+  if(state!==S.ASSEMBLE && state!==S.ABSORB) devShown=lerp(devShown, devPct, 1-Math.exp(-6*dt));
+}
+
+/* ===========================  RENDER  =========================== */
+let prevT=performance.now()*0.001, startT=prevT, T=0;
+function frame(){
+  const now=performance.now(), t=now*0.001; let dt=t-prevT; prevT=t; if(dt>0.05)dt=0.05; T=t-startT;
+  readMouth(now); updateCrop(); tickState(dt, now);
+
+  gl.clearColor(0.012,0.004,0.009,1.0); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.uniform1f(u.time,T); gl.uniform1f(u.hasCrop,hasCrop);                    // GL always draws — the grid ground is continuous
+  gl.uniform1f(u.aspect,frozen?stillAspect:cropAspect); gl.uniform1f(u.capture,capAmt); gl.uniform1f(u.inflate,inflate);
+  gl.uniform1f(u.scanY,scanY); gl.uniform1f(u.chill,chill); gl.uniform1f(u.stretch,stretch); gl.uniform1f(u.wet,wetAmt);
+  gl.uniform1f(u.face, MEAT_OFF.has(state)?1:0);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+
+  xc.clearRect(0,0,sizePx,sizePx);
+  const k=DUR[state]?clamp(st/DUR[state],0,1):0;
+  if(state===S.STANDBY) drawStandby();
+  else if(state===S.FACE) drawFace(k);
+  else if(state===S.DISFACE) drawDisface(k);
+  else if(state===S.ACQUIRE) drawAcquire(k);
+  else if(state===S.COMPARE) drawCompare(k);
+  else if(state===S.MEASURE) drawMeasure(k);
+  else if(state===S.STRESS) drawStress(k);
+  else if(state===S.DISASSEMBLE) drawDisassemble(k);
+  else if(state===S.DELTA) drawDelta(k);
+  else if(state===S.ASSEMBLE) drawAssemble(k);
+  else if(state===S.ARCHIVE) drawArchive(k);
+  else if(state===S.RETURN) drawArchive(1);
+  drawChrome();
+  drawHud();
+  requestAnimationFrame(frame);
+}
+
+/* ---------- cold-type helpers (no fade — scramble/step/count) ---------- */
+const rnd=(s)=>{ const x=Math.sin(s*127.1)*43758.5453; return x-Math.floor(x); };
+const GP='ABCDEF0123456789/#░▒▓';
+function scr(text){ const step=Math.floor(T*30); let o=''; for(let i=0;i<text.length;i++){ const c=text[i]; o+= (c===' '?' ':GP[Math.floor(rnd(step+i*3.1)*GP.length)]); } return o; }
+function ctext(s, x, y, o){ o=o||{}; const size=o.size||9, col=o.col||CYAN, w=o.w||400, align=o.align||'left';
+  xc.save(); xc.font=(w===700?'700 ':'')+size+"px 'PP Fraktion Mono',monospace"; xc.textAlign=align; xc.textBaseline='alphabetic';
+  if(o.cap){ xc.fillStyle='#000'; for(const off of [[-1,0],[1,0],[0,-1],[0,1]]) xc.fillText(s,x+off[0],y+off[1]); }
+  xc.fillStyle=col; xc.fillText(s,x,y); xc.restore();
+}
+function pad(n,w){ return String(Math.max(0,Math.round(n))).padStart(w,'0'); }
+const SHA=(()=>{ let h=''; for(let i=0;i<6;i++) h+=GP[Math.floor(rnd(count*7+i)*16)]; return h; })();
+function specId(){ return 'SPEC-MTH-'+pad(count,4); }
+
+/* ---------- the still cold cage: inset rule, four fixed corners, deviation axis, status ribbon ---------- */
+function drawChrome(){
+  const ins=INSET(), R={x:ins,y:ins,w:sizePx-2*ins,h:sizePx-2*ins};
+  xc.save();
+  xc.strokeStyle=CY+'0.55)'; xc.lineWidth=1; xc.strokeRect(R.x+0.5,R.y+0.5,R.w-1,R.h-1);   // 1px measurement frame
+  const top=R.y-6, bot=R.y+R.h+13;
+  ctext(specId()+' · SHA·'+SHA, R.x, top, {size:9,col:CY+'0.6)'});                          // TL specimen id + digest
+  ctext('FRAME '+pad(frameCount,6), R.x+R.w, top, {size:9,col:CY+'0.6)',align:'right'});    // TR monotonic clock
+  const mode=(T-modeSwapAt<0.20)?scr(MODE[state]):MODE[state];
+  ctext('MODE '+mode, R.x, bot, {size:9,col:CY+'0.85)'});                                   // BL current stage (scramble-snap)
+  const sig=devShown/100*4.2; ctext('Δ AVG  +'+sig.toFixed(3)+'σ', R.x+R.w, bot, {size:9,col:WHITE,align:'right'}); // BR datum
+  drawAxis(R);                                                                              // deviation made physical
+  const ribbon=RIBBON();
+  ctext((T-modeSwapAt<0.20)?scr(ribbon):ribbon, R.x, R.y+R.h-7, {size:11,col:CYAN});        // status ribbon
+  xc.restore();
+}
+function drawAxis(R){
+  const ax=R.x+R.w-2, y0=R.y+6, y1=R.y+R.h-18, mid=(y0+y1)/2;
+  xc.save(); xc.strokeStyle=CY+'0.5)'; xc.lineWidth=1;
+  xc.beginPath(); xc.moveTo(ax,y0); xc.lineTo(ax,y1); xc.stroke();
+  for(let i=0;i<=10;i++){ const y=lerp(y0,y1,i/10), heavy=(i===5); xc.beginPath(); xc.moveTo(ax-(heavy?7:4),y); xc.lineTo(ax,y); xc.stroke(); }
+  ctext('AVG', ax-10, mid+3, {size:7,col:CY+'0.8)',align:'right'});
+  const yc=lerp(mid, y0, clamp(devShown/100,0,1));                            // caret height = deviation
+  xc.strokeStyle=WHITE; xc.lineWidth=1; xc.beginPath(); xc.moveTo(ax-1,mid); xc.lineTo(ax-1,yc); xc.stroke();   // 1px hairline = the stat
+  ctext('▸', ax+2, yc+3, {size:9,col:WHITE});
+  xc.restore();
+}
+function RIBBON(){
+  const corpus=(SEED_N+count);
+  switch(state){
+    case S.STANDBY: return presence>0.5?'> SUBJECT DETECTED':'·· STANDBY   AWAITING SUBJECT';
+    case S.FACE:{ const v=Math.min(478,Math.floor(st/DUR[state]*1300));
+      return st>DUR[state]*0.32?'FACE GEOMETRY · LOCK   ·   478 VERTICES':('// RECOGNISING //   SAMPLING '+pad(v,3)+'/478 VERTICES'); }
+    case S.DISFACE:{ const feats=['OCULAR','SUPRAORBITAL','NASAL','AURICULAR','BUCCAL','MANDIBULAR'];
+      if(st<DUR[state]*0.14) return '// FRAGMENTING //   PARSING 11 REGIONS';
+      if(st<DUR[state]*0.46) return '// EXTRACTING //   ISOLATING BODY REGIONS';
+      if(st>DUR[state]*0.86) return 'RETAINED — 01 / 11 · ARTICULATORY   ·   FACE — PURGED';
+      const f=clamp(Math.floor((st/DUR[state]-0.46)/0.072),0,5); return feats[f]+' — DISCARD'; }
+    case S.STRESS:{ const wmm=(41.2*(1+stretch*0.55)); return stretch>0.96?'STRESS TEST   ·   MAX STRAIN':('STRESS TEST   ·   WIDTH '+wmm.toFixed(1)+'mm · STRAIN '+(1+stretch*0.55).toFixed(2)+'×'); }
+    case S.ACQUIRE:{ const lock=Math.min(68,Math.floor(st/DUR[state]*72)); const cd=Math.max(1,3-Math.floor(st/(DUR[state]/3.2)));
+      return st>DUR[state]*0.7?('// ACQUIRING //   ALIGN AND HOLD · '+cd):('// ACQUIRING //   SEGMENTING LIP / GROUND · LANDMARK LOCK '+pad(lock,2)+'/68'); }
+    case S.CAPTURE: return 'SPECIMEN ACQUIRED · '+specId()+' ENROLLED';
+    case S.COMPARE: return '// MATCHING //   QUERYING CORPUS · '+pad(corpus,5)+' RECORDS · RESOLVING '+pad(resolvePct,2)+'%';
+    case S.MEASURE: return 'MEASURE :: §4 ARTICULATORY   ·   DEVIATION FROM AVERAGE '+devShown.toFixed(1)+'%';
+    case S.DISASSEMBLE: return '// PARSING SUB-REGIONS //   06 SUB-REGIONS';
+    case S.DELTA: return 'TARGET :: POPULATION MEAN   ·   GAP TO TARGET '+devShown.toFixed(1)+'%';
+    case S.ASSEMBLE: return '// NORMALIZING //   NORMALIZE '+pad(normPct,2)+'%   ·   Δ AVG '+devShown.toFixed(1)+'% → 00.0%';
+    case S.ABSORB: return '[ NORMALIZED ]   SPECIMEN = MEAN   ·   Δ AVG 00.0%';
+    case S.ARCHIVE: case S.RETURN: return 'ALL RECORDS NORMALIZED   ·   64 RECORDS · 1 SHAPE · Δσ 0.000';
+  }
+  return '';
+}
+
+/* ---------- mapping rings → pixels ---------- */
+function ringPx(ring){ const R=mouthRect(); return ring? ring.map(([uu,v])=>[R.x+uu*R.w,R.y+v*R.h]) : null; }
+function strokeRing(P,style,w,dash){ if(!P)return; xc.save(); if(dash)xc.setLineDash(dash); xc.strokeStyle=style; xc.lineWidth=w;
+  xc.beginPath(); P.forEach((p,i)=> i?xc.lineTo(p[0],p[1]):xc.moveTo(p[0],p[1])); xc.closePath(); xc.stroke(); xc.restore(); }
+function reticle(R){ const cx=R.x+R.w/2, cy=R.y+R.h/2, g=14;                  // open crosshair — never covers the centroid
+  xc.save(); xc.strokeStyle=CY+'0.8)'; xc.lineWidth=1;
+  xc.beginPath(); xc.moveTo(cx-44,cy); xc.lineTo(cx-g,cy); xc.moveTo(cx+g,cy); xc.lineTo(cx+44,cy);
+  xc.moveTo(cx,cy-44); xc.lineTo(cx,cy-g); xc.moveTo(cx,cy+g); xc.lineTo(cx,cy+44); xc.stroke(); xc.restore(); }
+
+/* ---------- ACQUIRE: stepped scan + isolation contour ---------- */
+function drawAcquire(k){
+  const R=mouthRect(); const ring=ringPx(frozen?capLip:liveRing);
+  if(scanY>=0){ const y=scanY*sizePx; xc.save();                               // 2px stepped scan line (white lead + cyan core)
+    xc.strokeStyle=WHITE; xc.lineWidth=1; xc.beginPath(); xc.moveTo(R.x-10,y-1); xc.lineTo(R.x+R.w+10,y-1); xc.stroke();
+    xc.strokeStyle=CYAN; xc.lineWidth=1; xc.beginPath(); xc.moveTo(R.x-10,y); xc.lineTo(R.x+R.w+10,y); xc.stroke(); xc.restore(); }
+  if(ring){ const n=Math.max(2,Math.floor(k*ring.length*1.6)+2);              // isolation contour locks point by point
+    xc.save(); xc.strokeStyle=CY+'0.85)'; xc.lineWidth=1.2; xc.beginPath();
+    for(let i=0;i<n;i++){ const p=ring[i%ring.length]; i?xc.lineTo(p[0],p[1]):xc.moveTo(p[0],p[1]); } xc.stroke();
+    for(let i=0;i<ring.length;i+=4){ const p=ring[i]; xc.strokeStyle=CY+'0.6)'; xc.beginPath(); xc.moveTo(p[0]-3,p[1]); xc.lineTo(p[0]+3,p[1]); xc.stroke(); }
+    xc.restore(); }
+  reticle(R);
+}
+/* ---------- COMPARE: your mouth REPLACED by each catalog mouth in turn + the nearest-neighbour match ---------- */
+function drawCompare(k){
+  const R=mouthRect(), ins=INSET();
+  const ready = SWAP && swapMouths.length;
+  // RESULT — once the real flux swap has baked, reveal the SEAMLESS swapped mouth (the donor mouth inpainted onto your face)
+  if(ready){ const cur=Math.floor(st/0.5)%swapMouths.length; drawSwapPatch(swapMouths[cur],R);
+    xc.strokeStyle=CY+'0.85)'; xc.lineWidth=1; xc.strokeRect(R.x+0.5,R.y+0.5,R.w-1,R.h-1);
+    ctext('GRAFT · DONOR-'+pad(cur+1,2), R.x, R.y-3, {size:8,col:WHITE,cap:true}); }
+  reticle(R);
+  // COMPARISON — candidate donor list with match %, nearest-neighbour resolving, closest highlighted
+  const N=8; let best=0,bestv=-1; const mval=i=>clamp(38+rnd(i*3+count*2)*54+resolvePct*0.18,0,99);
+  for(let i=0;i<N;i++){ const v=mval(i); if(v>bestv){bestv=v;best=i;} }
+  ctext('NEAREST-NEIGHBOUR · CANDIDATE MATCH', ins, ins+16, {size:7,col:CY+'0.6)'});
+  for(let i=0;i<N;i++){ const y=ins+30+i*16, isbest=(i===best&&resolvePct>72);
+    ctext((isbest?'▸':' ')+'DONOR-'+pad(i+1,2), ins, y, {size:8,col:isbest?WHITE:CY+'0.5)'});
+    ctext('MATCH '+mval(i).toFixed(0)+'%', ins+118, y, {size:8,col:isbest?WHITE:CY+'0.6)'}); }
+  ctext(ready?('QUERYING CORPUS · '+pad(SEED_N+count,5)+' RECORDS'):'// GRAFTING DONOR ORAL · GENERATING //', sizePx/2, R.y+R.h+30, {size:8,col:CY+'0.7)',cap:true,align:'center'});
+  ctext((ready?'RESOLVED  ':'GENERATING  ')+pad(resolvePct,2)+'%', sizePx/2, R.y+R.h+54, {size:18,col:WHITE,w:700,cap:true,align:'center'});
+  if(ready) ctext('CLOSEST · DONOR-'+pad(best+1,2)+' · '+bestv.toFixed(0)+'%', sizePx/2, R.y+R.h+72, {size:9,col:CYAN,cap:true,align:'center'});
+}
+
+/* ---------- MEASURE: real coordinate dump + classification + headline deviation ---------- */
+/* real lip morphometry from the captured ring — honest geometry, in mm */
+function lipMetrics(){
+  const P=ringPx(capLip); if(!P) return null; const sc=120/sizePx;
+  const MM=(a,b)=>Math.hypot(a[0]-b[0],a[1]-b[1])/sizePx*120;             // px → nominal mm
+  const W=MM(P[0],P[10]), mid=[(P[0][0]+P[10][0])/2,(P[0][1]+P[10][1])/2], H=MM(P[5],P[15]);
+  const upV=MM(P[5],mid), loV=MM(P[15],mid);
+  let A=0,per=0; for(let i=0;i<P.length;i++){ const a=P[i],b=P[(i+1)%P.length]; A+=a[0]*b[1]-b[0]*a[1]; per+=Math.hypot(a[0]-b[0],a[1]-b[1]); }
+  const area=Math.abs(A)/2*sc*sc, perim=per*sc, orient=Math.atan2(P[10][1]-P[0][1],P[10][0]-P[0][0])*180/Math.PI;
+  let sym=0,cnt=0; const mx=mid[0];
+  for(const pr of [[1,9],[2,8],[3,7],[4,6],[11,19],[12,18],[13,17],[14,16]]){ const a=pr[0],b=pr[1];
+    sym+=Math.hypot((2*mx-P[a][0])-P[b][0], P[a][1]-P[b][1]); cnt++; }
+  const symIdx=clamp(100-sym/cnt*sc*9,0,100);
+  const v1=[P[4][0]-P[5][0],P[4][1]-P[5][1]], v2=[P[6][0]-P[5][0],P[6][1]-P[5][1]];
+  const cb=Math.acos(clamp((v1[0]*v2[0]+v1[1]*v2[1])/((Math.hypot(v1[0],v1[1])*Math.hypot(v2[0],v2[1]))||1),-1,1))*180/Math.PI;
+  return {W,H,ratio:W/Math.max(0.1,H),upV,loV,vr:upV/Math.max(0.1,loV),area,perim,orient,symIdx,cb};
+}
+function drawMeasure(k){
+  const R=mouthRect(), ring=ringPx(capLip), ins=INSET(), m=lipMetrics(); if(!m||!ring) return;
+  // --- specimen annotation: contour, numbered landmark crosses, dimension lines ---
+  strokeRing(ring, CY+'0.85)', 1.2);
+  xc.save(); xc.strokeStyle=CY+'0.55)'; xc.lineWidth=1;
+  for(let i=0;i<ring.length;i++){ const p=ring[i]; xc.beginPath(); xc.moveTo(p[0]-3,p[1]); xc.lineTo(p[0]+3,p[1]); xc.moveTo(p[0],p[1]-3); xc.lineTo(p[0],p[1]+3); xc.stroke();
+    if(i%2===0) ctext('p'+pad(i,2), p[0]+4, p[1]-2, {size:6,col:CY+'0.6)'}); }
+  xc.strokeStyle=WHITE; xc.lineWidth=1; xc.setLineDash([4,3]); xc.beginPath();
+  xc.moveTo(ring[0][0],ring[0][1]); xc.lineTo(ring[10][0],ring[10][1]);                  // width line
+  xc.moveTo(ring[5][0],ring[5][1]); xc.lineTo(ring[15][0],ring[15][1]); xc.stroke(); xc.setLineDash([]); xc.restore();   // height line
+  ctext(m.W.toFixed(1)+'mm', (ring[0][0]+ring[10][0])/2, (ring[0][1]+ring[10][1])/2-4, {size:8,col:WHITE,cap:true,align:'center'});
+  reticle(R);
+  // --- the clinical morphometry strip (top band): dense, clear, stepped reveal ---
+  const cells=[
+    ['COMM WIDTH', m.W.toFixed(1)+' mm'],['VERMILION H', m.H.toFixed(1)+' mm'],['UPPER VERM', m.upV.toFixed(1)+' mm'],
+    ['LOWER VERM', m.loV.toFixed(1)+' mm'],['UP / LO', m.vr.toFixed(2)],['WIDTH / H', m.ratio.toFixed(2)],
+    ['FISSURE AREA', m.area.toFixed(0)+' mm²'],['PERIMETER', m.perim.toFixed(1)+' mm'],['BOW ANGLE', m.cb.toFixed(1)+'°'],
+    ['AXIAL ORIENT', (m.orient>=0?'+':'')+m.orient.toFixed(1)+'°'],['SYMMETRY IDX', m.symIdx.toFixed(1)+'%'],['REGISTER','§4 ART'],
+  ];
+  const cols=6, cw=(sizePx-2*ins)/cols, shown=Math.min(cells.length, Math.floor(k*cells.length*1.5)+1);
+  for(let i=0;i<shown;i++){ const c=i%cols, rr=Math.floor(i/cols), x=ins+c*cw, y=ins+18+rr*42;
+    ctext(cells[i][0], x, y, {size:6,col:CY+'0.55)'});
+    ctext(cells[i][1], x, y+13, {size:11,col:CYAN});
+    if(i<11) ctext('Δ '+(devPct*(0.4+rnd(i+count)*1.1)).toFixed(0)+'%', x, y+23, {size:6,col:CY+'0.4)'}); }
+  // --- the deviation verdict (bottom band) ---
+  ctext('DEVIATION FROM POPULATION MEAN', sizePx/2, R.y+R.h+32, {size:8,col:CY+'0.7)',cap:true,align:'center'});
+  ctext('Δ AVG  '+devShown.toFixed(1)+'%', sizePx/2, R.y+R.h+56, {size:20,col:WHITE,w:700,cap:true,align:'center'});
+}
+/* ---------- DISASSEMBLE: segment into labelled sub-regions, each measured ---------- */
+const SUBR=[['UPPER LIP',0.18],['LOWER LIP',0.30],["CUPID'S BOW",0.46],['ORAL COMMISURE',0.62],['VERMILION',0.78],['CENTRAL VOLUME',0.92]];
+const PARTS=[ {sx:0.15,sy:0.05,sw:0.70,sh:0.42,dx:0,dy:-1},{sx:0.15,sy:0.52,sw:0.70,sh:0.43,dx:0,dy:1},
+  {sx:0.00,sy:0.28,sw:0.30,sh:0.46,dx:-1.2,dy:0},{sx:0.70,sy:0.28,sw:0.30,sh:0.46,dx:1.2,dy:0},{sx:0.36,sy:0.36,sw:0.28,sh:0.30,dx:0,dy:0} ];
+const segOff=document.createElement('canvas'); segOff.width=segOff.height=240; const segCtx=segOff.getContext('2d');
+function drawSegPart(sx,sy,sw,sh,dx,dy,dw,dh){ segCtx.clearRect(0,0,240,240); try{ segCtx.drawImage(cropCv,sx,sy,sw,sh,0,0,240,240);}catch(e){return;}
+  segCtx.globalCompositeOperation='destination-in'; const g=segCtx.createRadialGradient(120,120,52,120,120,140);
+  g.addColorStop(0,'#000'); g.addColorStop(0.6,'#000'); g.addColorStop(1,'rgba(0,0,0,0)'); segCtx.fillStyle=g; segCtx.fillRect(0,0,240,240);
+  segCtx.globalCompositeOperation='source-over'; xc.drawImage(segOff,0,0,240,240,dx,dy,dw,dh); }
+function drawDisassemble(k){
+  if(!hasCrop) return; const R=mouthRect(), W=cropCv.width,H=cropCv.height, ins=INSET();
+  const e=(DEBUG&&window.__holdE!=null)?window.__holdE:Math.sin(clamp(k,0,1)*Math.PI);
+  PARTS.forEach((P)=>{ const dw=R.w*P.sw,dh=R.h*P.sh,bx=R.x+P.sx*R.w+dw/2,by=R.y+P.sy*R.h+dh/2;
+    const px=bx+P.dx*R.w*0.16*e, py=by+P.dy*R.h*0.24*e;
+    drawSegPart(P.sx*W,P.sy*H,P.sw*W,P.sh*H, px-dw/2,py-dh/2, dw,dh);
+    if(e>0.25){ xc.save(); xc.strokeStyle=CY+'0.55)'; xc.lineWidth=1; xc.strokeRect(px-dw/2,py-dh/2,dw,dh); xc.restore(); } });
+  const n=Math.min(SUBR.length, Math.floor(k*SUBR.length*1.6)+1);
+  for(let i=0;i<n;i++){ const y=R.y+18+i*16, dpc=(devPct*(0.6+SUBR[i][1]*0.9)).toFixed(1);
+    ctext(pad(i+1,2)+'  '+SUBR[i][0], R.x+R.w-160, y, {size:8,col:CY+'0.7)'});
+    ctext('Δ '+dpc+'%', R.x+R.w, y, {size:8,col:CYAN,align:'right'}); }
+}
+/* ---------- DELTA: the AVERAGE template as target; the gap ---------- */
+function drawDelta(k){
+  const ring=ringPx(capLip), tp=ringPx(meanTemplateFor(capLip)); if(!ring||!tp) return;
+  strokeRing(ring, CY+'0.85)', 1.3);
+  strokeRing(tp, WHITE, 1.4, [5,4]);                                          // the population mean (dashed = target)
+  for(let i=0;i<ring.length;i+=3){ xc.save(); xc.strokeStyle=CY+'0.5)'; xc.lineWidth=1;
+    xc.beginPath(); xc.moveTo(ring[i][0],ring[i][1]); xc.lineTo(tp[i][0],tp[i][1]); xc.stroke(); xc.restore(); }   // gap arrows
+  const R=mouthRect(), y=R.y-10, x0=R.x+10, x1=R.x+R.w-10, xm=lerp(x0+54,x1,clamp(devShown/100,0,1));
+  ctext('SPECIMEN', x0, y, {size:8,col:CY+'0.8)',cap:true});
+  ctext('MEAN', x1, y, {size:8,col:WHITE,cap:true,align:'right'});
+  xc.save(); xc.strokeStyle=CY+'0.6)'; xc.lineWidth=1; xc.setLineDash([3,3]); xc.beginPath(); xc.moveTo(x0+54,y-3); xc.lineTo(xm,y-3); xc.stroke(); xc.restore();
+  ctext('Δ '+devShown.toFixed(1)+'%', (x0+x1)/2, y-12, {size:12,col:WHITE,w:700,cap:true,align:'center'});
+}
+/* ---------- ASSEMBLE: normalize the specimen toward the mean ---------- */
+function drawAssemble(k){
+  const ring=ringPx(capLip), tp=ringPx(meanTemplateFor(capLip)); if(!ring||!tp) return;
+  const cur=ring.map((p,i)=>[lerp(p[0],tp[i][0],k), lerp(p[1],tp[i][1],k)]);
+  strokeRing(tp, WHITE, 1, [5,4]); strokeRing(cur, CYAN, 1.3);
+  const R=mouthRect(); ctext('NORMALIZE '+pad(normPct,2)+'%', R.x+R.w/2, R.y-10, {size:13,col:WHITE,w:700,cap:true,align:'center'});
+}
+/* ---------- ARCHIVE: 64 records, 1 shape (the cold punchline) ---------- */
+function drawArchive(k){
+  const ins=INSET(), R={x:ins+2,y:ins+2,w:sizePx-2*ins-4,h:sizePx-2*ins-4};
+  const N=8, cell=Math.min(R.w,R.h)/N, gx=R.x+(R.w-cell*N)/2, gy=R.y+(R.h-cell*N)/2;
+  const total=N*N, shown=Math.min(total, Math.floor(smoothstep(0,0.7,k)*total*1.1));   // stamp in row by row, fast
+  const src=(hasCrop?cropCv:null);
+  for(let idx=0; idx<shown; idx++){ const r=Math.floor(idx/N), c=idx%N, x=gx+c*cell, y=gy+r*cell;
+    xc.save(); xc.beginPath(); xc.rect(x+1,y+1,cell-2,cell-2); xc.clip();
+    if(src){ const a=cropAspect; let dw=cell-2,dh=(cell-2)/a; if(dh<cell-2){ dh=cell-2; dw=dh*a; }
+      xc.globalAlpha=0.92; xc.drawImage(src, x+(cell-2-dw)/2+1, y+(cell-2-dh)/2+1, dw, dh);
+      xc.fillStyle='rgba(0,40,40,0.45)'; xc.fillRect(x+1,y+1,cell-2,cell-2);   // every record cooled to the same dead tone
+    } else { xc.fillStyle='rgba(0,30,28,0.7)'; xc.fillRect(x+1,y+1,cell-2,cell-2); }
+    xc.restore();
+    xc.strokeStyle=CY+'0.35)'; xc.lineWidth=1; xc.strokeRect(x+0.5,y+0.5,cell,cell);
+    ctext(pad(rnd(idx*7+1)*99999,5), x+3, y+cell-9, {size:6,col:CY+'0.7)'});   // distinct id...
+    ctext('Δ 0.0', x+3, y+cell-3, {size:6,col:CY+'0.5)'});                     // ...identical shape
+  }
+}
+
+/* ===========================  FACE OPENING — recognition · purge · stress  =========================== */
+function convexHull(pts){ if(pts.length<3) return pts.slice();
+  const p=pts.slice().sort((a,b)=>a[0]-b[0]||a[1]-b[1]); const cr=(o,a,b)=>(a[0]-o[0])*(b[1]-o[1])-(a[1]-o[1])*(b[0]-o[0]);
+  const lo=[]; for(const q of p){ while(lo.length>=2&&cr(lo[lo.length-2],lo[lo.length-1],q)<=0)lo.pop(); lo.push(q); }
+  const up=[]; for(let i=p.length-1;i>=0;i--){ const q=p[i]; while(up.length>=2&&cr(up[up.length-2],up[up.length-1],q)<=0)up.pop(); up.push(q); }
+  lo.pop(); up.pop(); return lo.concat(up); }
+function clipHull(h){ xc.beginPath(); h.forEach((p,i)=>i?xc.lineTo(p[0],p[1]):xc.moveTo(p[0],p[1])); xc.closePath(); }
+function faceScreenPts(L,plate){ const a=new Array(468); for(let i=0;i<468;i++) a[i]=faceVtx(L,i,plate); return a; }
+function drawFaceVideo(plate,hull){
+  xc.save(); if(hull){ clipHull(hull); xc.clip(); }
+  if(camOK&&vid.readyState>=2&&vid.videoWidth){ const b=faceBox,vw=vid.videoWidth,vh=vid.videoHeight;
+    xc.translate(plate.x+plate.w,plate.y); xc.scale(-1,1);
+    try{ xc.drawImage(vid,(b.cx-b.hx)*vw,(b.cy-b.hy)*vh,2*b.hx*vw,2*b.hy*vh,0,0,plate.w,plate.h); }catch(e){}
+  } else { xc.fillStyle='rgba(0,22,20,0.6)'; xc.fillRect(plate.x,plate.y,plate.w,plate.h); }
+  xc.restore(); }
+function drawMesh(L,pts,o){ o=o||{};
+  const live=o.live||(()=>true), pos=o.pos||(i=>pts[i]);
+  xc.save(); xc.globalCompositeOperation='lighter';
+  xc.strokeStyle=CY+'0.6)'; xc.lineWidth=1; xc.beginPath();
+  for(const e of faceEdges){ const a=e[0],b=e[1]; if(!live(a)||!live(b)) continue; if(o.inkEdge&&!o.inkEdge(a,b)) continue;
+    const pa=pos(a),pb=pos(b); if(!pa||!pb) continue; xc.moveTo(pa[0],pa[1]); xc.lineTo(pb[0],pb[1]); }
+  xc.stroke();
+  for(let i=0;i<468;i++){ if(!live(i)) continue; if(o.inkNode&&!o.inkNode(i)) continue; const p=pos(i); if(!p) continue;
+    xc.fillStyle=CY+'0.8)'; xc.fillRect(p[0]-1,p[1]-1,2,2); }                          // sample-points = squares, not circles
+  if(o.accent) for(const i of ACCENT){ if(!live(i)) continue; const p=pos(i); if(!p) continue; xc.fillStyle=WHITE; xc.fillRect(p[0]-1.5,p[1]-1.5,3,3); }
+  xc.restore(); }
+function plateLabel(plate){ ctext('SUBJECT — 01', plate.x, plate.y-7, {size:10,col:WHITE,cap:true}); }
+function drawStandby(){ const R=mouthRect(); reticle(R);
+  const yb=R.y+(((T*0.35)%1))*R.h; xc.save(); xc.strokeStyle=CY+'0.4)'; xc.lineWidth=1;   // idle sampling sweep on the grid
+  xc.beginPath(); xc.moveTo(R.x,yb); xc.lineTo(R.x+R.w,yb); xc.stroke(); xc.restore(); }
+function drawFace(k){
+  if(!lastLM||!faceEdges){ drawStandby(); return; }
+  const L=lastLM, plate=facePlate(), pts=faceScreenPts(L,plate), hull=convexHull(pts);
+  drawFaceVideo(plate,hull); plateLabel(plate);
+  const nodeP=clamp(k/0.13,0,1), edgeP=clamp((k-0.13)/0.11,0,1), accent=k>0.24;
+  const ny=i=>(pts[i][1]-plate.y)/plate.h;
+  drawMesh(L,pts,{ inkNode:i=>ny(i)<=nodeP*1.06,                                          // pass A: sample-points top→bottom
+    inkEdge:(a,b)=>ny(a)<=nodeP*1.06&&ny(b)<=nodeP*1.06&&Math.max(faceSeed[a],faceSeed[b])<=edgeP, // pass B: triangulate
+    accent });                                                                            // pass C: white ID points
+}
+/* the face decomposed into LABELLED BODY-PART tiles, struck in priority order, mouth retained (Scan/Consent register) */
+function partBoxes(L,plate){
+  const N=11, sx=Array(N).fill(1e9),sy=Array(N).fill(1e9),ex=Array(N).fill(-1e9),ey=Array(N).fill(-1e9);
+  const vx0=Array(N).fill(1e9),vy0=Array(N).fill(1e9),vx1=Array(N).fill(-1e9),vy1=Array(N).fill(-1e9);
+  for(let i=0;i<468;i++){ const r=faceRegion[i]; const p=faceVtx(L,i,plate);
+    if(p[0]<sx[r])sx[r]=p[0]; if(p[1]<sy[r])sy[r]=p[1]; if(p[0]>ex[r])ex[r]=p[0]; if(p[1]>ey[r])ey[r]=p[1];
+    const vx=L[i].x,vy=L[i].y; if(vx<vx0[r])vx0[r]=vx; if(vy<vy0[r])vy0[r]=vy; if(vx>vx1[r])vx1[r]=vx; if(vy>vy1[r])vy1[r]=vy; }
+  const out=[]; for(let r=0;r<N;r++){ if(ex[r]<sx[r]){ out.push(null); continue; } const pd=7;
+    out.push({ d:{x:sx[r]-pd,y:sy[r]-pd,w:ex[r]-sx[r]+2*pd,h:ey[r]-sy[r]+2*pd}, s:{x:vx0[r],y:vy0[r],w:vx1[r]-vx0[r],h:vy1[r]-vy0[r]} }); }
+  return out;
+}
+function drawTile(box,dst,frameAlpha){                                                    // sharp body-part cut-out (no blur)
+  xc.save(); xc.beginPath(); xc.rect(dst.x,dst.y,dst.w,dst.h); xc.clip();
+  if(camOK&&vid.readyState>=2&&vid.videoWidth){ const vw=vid.videoWidth,vh=vid.videoHeight;
+    xc.translate(dst.x+dst.w,dst.y); xc.scale(-1,1);
+    try{ xc.drawImage(vid, box.s.x*vw,box.s.y*vh,box.s.w*vw,box.s.h*vh, 0,0,dst.w,dst.h); }catch(e){}
+  } else { xc.fillStyle='rgba(0,22,20,0.6)'; xc.fillRect(dst.x,dst.y,dst.w,dst.h); }
+  xc.restore();
+  xc.strokeStyle=CY+(frameAlpha||0.7)+')'; xc.lineWidth=1; xc.strokeRect(dst.x+0.5,dst.y+0.5,dst.w-1,dst.h-1);   // 1px isolation frame
+}
+function drawSwapPatch(m,dst){                                                            // a real endpoint-composited foreign mouth, fitted into the mouth region
+  const ca=m.aspect, ra=dst.w/dst.h; let dw,dh; if(ca>ra){ dh=dst.h; dw=dh*ca; } else { dw=dst.w; dh=dw/ca; }
+  xc.save(); xc.beginPath(); xc.rect(dst.x,dst.y,dst.w,dst.h); xc.clip();
+  try{ xc.drawImage(m.canvas, dst.x+(dst.w-dw)/2, dst.y+(dst.h-dh)/2, dw, dh); }catch(e){}
+  xc.restore();
+}
+function drawDisface(k){
+  if(!lastLM||!faceRegion){ return; } const L=lastLM, plate=facePlate();
+  const boxes=partBoxes(L,plate);
+  let fcx=0,fcy=0,fn=0; for(const b of boxes){ if(b){ fcx+=b.d.x+b.d.w/2; fcy+=b.d.y+b.d.h/2; fn++; } } fcx/=fn||1; fcy/=fn||1;
+  const sep=smoothstep(0.16,0.42,k)*0.16;                                                  // parts ease apart (legible seams), modest
+  const dstart=p=> p>=99?9 : 0.46 + p*0.072;                                               // strike order ocular→mandibular over [0.46,0.82]
+  const mb=boxes[10], mc=mb?[mb.d.x+mb.d.w/2,mb.d.y+mb.d.h/2]:[sizePx/2,sizePx/2];
+  xc.save();
+  if(k>0.84 && mb){                                                                        // converge the retained lips INTO the GL mouth framing → seamless sharp handoff
+    const e=Math.floor(smoothstep(0.84,1.0,k)*3)/3; const R=mouthRect(), Rc=[R.x+R.w/2,R.y+R.h/2];
+    const sc=lerp(1,(R.w*0.92)/mb.d.w,e), cx=lerp(mc[0],Rc[0],e), cy=lerp(mc[1],Rc[1],e);
+    xc.translate(cx,cy); xc.scale(sc,sc); xc.translate(-mc[0],-mc[1]);
+  }
+  if(k<0.14){ const pts=faceScreenPts(L,plate); drawMesh(L,pts,{accent:true}); }           // mesh hands off to the part tiles
+  for(let r=0;r<11;r++){ const b=boxes[r]; if(!b) continue; const meta=BPARTS[r];
+    const ds=dstart(meta.prio), dc=clamp((k-ds)/0.05,0,1);                                 // strike progress
+    if(r!==10 && dc>=1) continue;                                                          // discarded → removed, reveals grid
+    const cx=b.d.x+b.d.w/2, cy=b.d.y+b.d.h/2, s=(r===10)?0:sep;
+    const dst={x:b.d.x+(cx-fcx)*s, y:b.d.y+(cy-fcy)*s, w:b.d.w, h:b.d.h};
+    const swapping=false;   // DISFACE swap removed — the flux swap is revealed in COMPARE once baked                // try foreign mouths on you BEFORE the mouth is fully separated
+    if(swapping){ const idx=Math.floor(T/0.1)%swapMouths.length; drawSwapPatch(swapMouths[idx],dst);
+      xc.strokeStyle=CY+'0.9)'; xc.lineWidth=1; xc.strokeRect(dst.x+0.5,dst.y+0.5,dst.w-1,dst.h-1);
+    } else { drawTile(b,dst, r===10?0.85:0.6); }
+    if(k>0.14){ ctext(swapping?'ARTICULATORY · FITTING':meta.label, dst.x, dst.y-3, {size:7,col:r===10?WHITE:CY+'0.8)'});
+      if(swapping) ctext('DONOR ·'+pad((Math.floor(T/0.1)%swapMouths.length)+1,2), dst.x, dst.y+dst.h+8, {size:6,col:CY+'0.75)'});
+      else if(r!==10) ctext((rnd(r+1)*9+6).toFixed(1)+'mm', dst.x, dst.y+dst.h+8, {size:6,col:CY+'0.5)'}); }
+    if(dc>0&&dc<1){ xc.strokeStyle=WHITE; xc.lineWidth=1; xc.beginPath();                  // struck-through on discard
+      xc.moveTo(dst.x,dst.y+dst.h/2); xc.lineTo(dst.x+dst.w*dc,dst.y+dst.h/2); xc.stroke(); }
+  }
+  xc.restore();
+}
+function drawStress(k){
+  const R=mouthRect(); reticle(R);
+  const cx=R.x+R.w/2, cy=R.y+R.h/2, hw=R.w/2*(1+stretch*0.55);
+  xc.save(); xc.strokeStyle=CYAN; xc.lineWidth=1.4;                                       // the caliper jaws (the force is visible)
+  for(const s of [-1,1]){ const x=cx+s*hw; xc.beginPath(); xc.moveTo(x,cy-26); xc.lineTo(x,cy+26);
+    xc.moveTo(x,cy-26); xc.lineTo(x-s*7,cy-26); xc.moveTo(x,cy+26); xc.lineTo(x-s*7,cy+26); xc.stroke(); }
+  xc.strokeStyle=CY+'0.5)'; xc.setLineDash([3,3]); xc.beginPath(); xc.moveTo(cx-hw,cy); xc.lineTo(cx+hw,cy); xc.stroke(); xc.restore();
+  const wmm=41.2*(1+stretch*0.55), strain=1+stretch*0.55;
+  ctext(stretch>0.96?'MAX STRAIN':('STRAIN '+strain.toFixed(2)+'×'), cx, R.y-10, {size:14,col:WHITE,w:700,cap:true,align:'center'});
+  ctext('WIDTH '+wmm.toFixed(1)+'mm', cx, R.y+R.h+0, {size:9,col:CYAN,align:'center'});
+}
+
+const hud=document.getElementById('umhud');
+function drawHud(){ if(!DEBUG){ hud.textContent=''; return; }
+  hud.textContent='['+NAME[state]+' '+st.toFixed(1)+'s] cam:'+(camOK?'OK':'NO')+' faces:'+faceCount+' mesh:'+(faceEdges?faceEdges.length:0)+' cap:'+capAmt.toFixed(2)+' str:'+stretch.toFixed(2)+' chill:'+chill.toFixed(2)+' dev:'+devShown.toFixed(1)+' mean(n='+meanN+')'+(SWAP?(' swap:'+swapState+'('+swapMouths.length+')'):''); }
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
